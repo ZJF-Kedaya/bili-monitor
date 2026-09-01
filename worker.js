@@ -518,6 +518,19 @@ async function debugInfo(env) {
   return out;
 }
 
+
+async function overview(env) {
+  var settings = await getSettings(env);
+  var lastSeen = await kvGet(env, 'lastSeen', {});
+  var latest = {};
+  var ups = settings.ups || [];
+  for (var i = 0; i < ups.length; i++) {
+    var u = ups[i] || {};
+    var s = lastSeen[u.mid] || {};
+    latest[u.mid] = { video: s.video || '', videoTitle: s.videoTitle || '' };
+  }
+  return { latest: latest };
+}
 async function checkAll(env) {
   const settings = await getSettings(env);
   const oldMap = await kvGet(env, 'lastSeen', {});
@@ -648,6 +661,11 @@ async function handleApi(request, env) {
     }
   }
 
+if (path === '/api/overview' && method === 'GET') {
+    var overviewData = await overview(env);
+    return json({ ok: true, latest: overviewData.latest });
+  }
+
 if (path === '/api/logs' && method === 'GET') {
     const logs = await kvGet(env, 'logs', []);
     return json({ ok: true, logs: logs });
@@ -747,7 +765,7 @@ const UI_HTML = [
 "<div class=\"card\"><h2>UP主管理</h2>",
 "<div class=\"row\"><div><label>UID 或空间链接</label><input id=\"newMid\" placeholder=\"例如 946974 或 https://space.bilibili.com/946974\"></div><div><label>名称（可选）</label><input id=\"newName\"></div></div>",
 "<button id=\"addBtn\">添加UP主</button>",
-"<table style=\"margin-top:14px\"><thead><tr><th>UP主</th><th>UID</th><th>视频</th><th>动态</th><th>通知</th><th>下载</th><th></th></tr></thead><tbody id=\"upList\"></tbody></table>",
+"<table style=\"margin-top:14px\"><thead><tr><th>UP主</th><th>UID</th><th>最新视频</th><th>视频</th><th>动态</th><th>通知</th><th>下载</th><th></th></tr></thead><tbody id=\"upList\"></tbody></table>",
 "</div>",
 "<div class=\"card\"><div style=\"display:flex;justify-content:space-between;align-items:center\"><h2>运行日志</h2><div><button id=\"runBtn\">立即检查</button> <button id=\"refreshLogsBtn\" class=\"gray\">刷新日志</button> <button id=\"clearLogsBtn\" class=\"gray\">清除日志</button> <button id=\"debugBtn\" class=\"gray\">调试</button></div></div>",
 "<div id=\"logs\" class=\"log\">加载中...</div>",
@@ -756,7 +774,7 @@ const UI_HTML = [
 "</div>",
 "<div id=\"toast\" class=\"toast\"></div>",
 "<script>",
-"var state={settings:null};",
+"var state={settings:null,latest:{}};",
 "function $(id){return document.getElementById(id);}",
 "function toast(msg){var el=$(\"toast\");el.textContent=msg;el.className=\"toast show\";setTimeout(function(){el.className=\"toast\";},2200);}",
 "function api(path,opts){opts=opts||{};opts.headers=Object.assign({\"Content-Type\":\"application/json\"},opts.headers||{});return fetch(path,opts).then(function(r){return r.json();});}",
@@ -764,13 +782,14 @@ const UI_HTML = [
 "function fillSettings(s){state.settings=s;$(\"cookie\").value=s.cookie||\"\";$(\"wecomWebhook\").value=s.wecomWebhook||\"\";$(\"downloadApi\").value=s.downloadApi||\"https://bili.kedaya.gq/api/download?url=\";$(\"rsshubBase\").value=s.rsshubBase||\"https://rsshub.liumingye.cn\";$(\"webdavUrl\").value=s.webdavUrl||\"\";$(\"webdavUser\").value=s.webdavUser||\"\";$(\"webdavPass\").value=s.webdavPass||\"\";$(\"intervalMinutes\").value=s.intervalMinutes||5;$(\"notifyOnFirstRun\").checked=!!s.notifyOnFirstRun;renderUps();}",
 "function makeTd(text){var td=document.createElement(\"td\");td.textContent=text;return td;}",
 "function makeCheck(checked,onChange){var td=document.createElement(\"td\");var input=document.createElement(\"input\");input.type=\"checkbox\";input.checked=!!checked;input.addEventListener(\"change\",function(e){onChange(e.target.checked);});td.appendChild(input);return td;}",
-"function renderUps(){var tb=$(\"upList\");tb.innerHTML=\"\";(state.settings.ups||[]).forEach(function(u){var tr=document.createElement(\"tr\");tr.appendChild(makeTd(u.name||\"未命名\"));tr.appendChild(makeTd(u.mid));tr.appendChild(makeCheck(u.monitorVideo!==false,function(v){u.monitorVideo=v;}));tr.appendChild(makeCheck(u.monitorDynamic!==false,function(v){u.monitorDynamic=v;}));tr.appendChild(makeCheck(u.notify!==false,function(v){u.notify=v;}));tr.appendChild(makeCheck(u.download!==false,function(v){u.download=v;}));var del=document.createElement(\"button\");del.textContent=\"删除\";del.className=\"gray\";del.style.marginTop=\"0\";del.addEventListener(\"click\",function(){deleteUp(u.id);});var td=document.createElement(\"td\");td.appendChild(del);tr.appendChild(td);tb.appendChild(tr);});}",
+"function renderUps(){var tb=$(\"upList\");tb.innerHTML=\"\";(state.settings.ups||[]).forEach(function(u){var tr=document.createElement(\"tr\");tr.appendChild(makeTd(u.name||\"未命名\"));tr.appendChild(makeTd(u.mid));var info=(state.latest&&state.latest[u.mid])||{};var latestTd=document.createElement(\"td\");if(info.video){var a=document.createElement(\"a\");a.textContent=info.videoTitle||info.video;a.href=\"https://www.bilibili.com/video/\"+encodeURIComponent(info.video);a.target=\"_blank\";a.rel=\"noopener\";latestTd.appendChild(a);}else{latestTd.textContent=\"暂无\";}tr.appendChild(latestTd);tr.appendChild(makeCheck(u.monitorVideo!==false,function(v){u.monitorVideo=v;}));tr.appendChild(makeCheck(u.monitorDynamic!==false,function(v){u.monitorDynamic=v;}));tr.appendChild(makeCheck(u.notify!==false,function(v){u.notify=v;}));tr.appendChild(makeCheck(u.download!==false,function(v){u.download=v;}));var del=document.createElement(\"button\");del.textContent=\"删除\";del.className=\"gray\";del.style.marginTop=\"0\";del.addEventListener(\"click\",function(){deleteUp(u.id);});var td=document.createElement(\"td\");td.appendChild(del);tr.appendChild(td);tb.appendChild(tr);});}",
 "function debugNow(){var btn=$(\"debugBtn\");btn.disabled=true;var box=$(\"debugBox\");api(\"/api/debug\").then(function(j){if(!j||!j.ok){box.textContent=\"调试失败：\"+(j&&j.error||\"\");}else{box.textContent=JSON.stringify(j.debug||j,null,2);}box.style.display=\"block\";toast(j&&j.ok?\"调试完成\":\"调试失败\");}).catch(function(){box.textContent=\"调试请求失败\";box.style.display=\"block\";toast(\"调试请求失败\");}).finally(function(){btn.disabled=false;});}",
+"function loadOverview(){api(\"/api/overview\").then(function(j){if(j&&j.ok){state.latest=j.latest||{};renderUps();}}).catch(function(){});}",
 "function loadSettings(){api(\"/api/settings\").then(function(j){if(j&&j.ok){fillSettings(j.settings||{});}else{toast((j&&j.error)||\"加载失败\");}}).catch(function(){toast(\"加载失败\");});}",
 "function saveSettings(){var data=collectSettings();api(\"/api/settings\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){if(j.ok){toast(\"已保存\");state.settings=j.settings||data;renderUps();}else{toast(j.error||\"保存失败\");}}).catch(function(){toast(\"保存失败\");});}",
 "function addUp(){var mid=$(\"newMid\").value.trim();var name=$(\"newName\").value.trim();if(!mid){toast(\"请输入UID或链接\");return;}api(\"/api/ups\",{method:\"POST\",body:JSON.stringify({mid:mid,name:name})}).then(function(j){if(j.ok){toast(\"已添加\");$(\"newMid\").value=\"\";$(\"newName\").value=\"\";loadSettings();}else{toast(j.error||\"添加失败\");}}).catch(function(){toast(\"添加失败\");});}",
 "function deleteUp(id){if(!confirm(\"确认删除该UP主？\"))return;api(\"/api/ups/delete\",{method:\"POST\",body:JSON.stringify({id:id})}).then(function(j){if(j.ok){toast(\"已删除\");loadSettings();}else{toast(j.error||\"删除失败\");}}).catch(function(){toast(\"删除失败\");});}",
-"function runNow(){api(\"/api/check\",{method:\"POST\"}).then(function(j){toast(j.ok?\"检查完成\":(j.error||\"检查失败\"));loadLogs();}).catch(function(){toast(\"检查失败\");loadLogs();});}",
+"function runNow(){api(\"/api/check\",{method:\"POST\"}).then(function(j){toast(j.ok?\"检查完成\":(j.error||\"检查失败\"));loadLogs();loadOverview();}).catch(function(){toast(\"检查失败\");loadLogs();loadOverview();});}",
 "function testWecom(){var data=collectSettings();api(\"/api/test-wecom\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"企微测试成功\":(j.error||\"测试失败\"));loadLogs();}).catch(function(){toast(\"测试失败\");loadLogs();});}",
 "function testWebdav(){var data=collectSettings();api(\"/api/test-webdav\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"WebDAV连接成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}",
 "function clearLogs(){if(!confirm(\"确认清除所有运行日志？\"))return;api(\"/api/logs/clear\",{method:\"POST\"}).then(function(j){if(j.ok){toast(\"日志已清除\");loadLogs();}else{toast(j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}",
@@ -783,7 +802,7 @@ const UI_HTML = [
 "$(\"debugBtn\").addEventListener(\"click\",debugNow);",
 "$(\"testWecomBtn\").addEventListener(\"click\",testWecom);",
 "$(\"testWebdavBtn\").addEventListener(\"click\",testWebdav);",
-"loadSettings();loadLogs();setInterval(function(){loadLogs();},15000);",
+"loadSettings();loadLogs();loadOverview();setInterval(function(){loadLogs();loadOverview();},15000);",
 "</script>",
 "</body>",
 "</html>"
