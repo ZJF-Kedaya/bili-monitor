@@ -336,7 +336,8 @@ async function sendWeCom(webhook, kind, author, title, url, env) {
   if (!resp.ok || (data && data.errcode !== undefined && data.errcode !== 0)) {
     throw new Error('企微返回 ' + resp.status + ' ' + JSON.stringify(data || ''));
   }
-  await addLog(env, 'info', '已发送企微通知：' + kind + ' / ' + truncate(title, 60));
+  await addLog(env, 'info', '已发送企微通知：' + kind + ' / ' + truncate(title, 60) + ' / ' + JSON.stringify(data || ''));
+  return data;
 }
 
 async function downloadAndUploadVideo(settings, up, bvid, title, env) {
@@ -667,10 +668,13 @@ if (path === '/api/logs' && method === 'GET') {
     const settings = await getSettings(env);
     if (!settings.wecomWebhook) return json({ ok: false, error: '未配置企业微信Webhook' }, 400);
     try {
-      await sendWeCom(settings.wecomWebhook, '测试消息', 'B站监控', '这是一条测试通知', 'https://www.bilibili.com/', env);
-      return json({ ok: true });
+      const detail = await sendWeCom(settings.wecomWebhook, '测试消息', 'B站监控', '这是一条测试通知', 'https://www.bilibili.com/', env);
+      await addLog(env, 'info', '企微测试成功：' + JSON.stringify(detail || ''));
+      return json({ ok: true, detail: detail || null });
     } catch (e) {
-      return json({ ok: false, error: String(e.message || e) }, 500);
+      const msg = String(e.message || e);
+      await addLog(env, 'error', '企微测试失败：' + msg);
+      return json({ ok: false, error: msg }, 500);
     }
   }
 
@@ -767,7 +771,7 @@ const UI_HTML = [
 "function addUp(){var mid=$(\"newMid\").value.trim();var name=$(\"newName\").value.trim();if(!mid){toast(\"请输入UID或链接\");return;}api(\"/api/ups\",{method:\"POST\",body:JSON.stringify({mid:mid,name:name})}).then(function(j){if(j.ok){toast(\"已添加\");$(\"newMid\").value=\"\";$(\"newName\").value=\"\";loadSettings();}else{toast(j.error||\"添加失败\");}}).catch(function(){toast(\"添加失败\");});}",
 "function deleteUp(id){if(!confirm(\"确认删除该UP主？\"))return;api(\"/api/ups/delete\",{method:\"POST\",body:JSON.stringify({id:id})}).then(function(j){if(j.ok){toast(\"已删除\");loadSettings();}else{toast(j.error||\"删除失败\");}}).catch(function(){toast(\"删除失败\");});}",
 "function runNow(){api(\"/api/check\",{method:\"POST\"}).then(function(j){toast(j.ok?\"检查完成\":(j.error||\"检查失败\"));loadLogs();}).catch(function(){toast(\"检查失败\");loadLogs();});}",
-"function testWecom(){var data=collectSettings();api(\"/api/test-wecom\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"企微测试成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}",
+"function testWecom(){var data=collectSettings();api(\"/api/test-wecom\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"企微测试成功\":(j.error||\"测试失败\"));loadLogs();}).catch(function(){toast(\"测试失败\");loadLogs();});}",
 "function testWebdav(){var data=collectSettings();api(\"/api/test-webdav\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"WebDAV连接成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}",
 "function clearLogs(){if(!confirm(\"确认清除所有运行日志？\"))return;api(\"/api/logs/clear\",{method:\"POST\"}).then(function(j){if(j.ok){toast(\"日志已清除\");loadLogs();}else{toast(j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}",
 "function loadLogs(){api(\"/api/logs\").then(function(j){var box=$(\"logs\");box.innerHTML=\"\";if(!j||!j.ok){box.textContent=\"加载失败\";return;}var logs=j.logs||[];if(!logs.length){box.textContent=\"暂无日志\";return;}logs.forEach(function(l){var div=document.createElement(\"div\");div.className=l.level||\"info\";var t=new Date(l.t).toLocaleString(\"zh-CN\",{hour12:false});div.textContent=\"[\"+t+\"] \"+l.msg;box.appendChild(div);});}).catch(function(){var box=$(\"logs\");box.textContent=\"加载失败\";});}",
