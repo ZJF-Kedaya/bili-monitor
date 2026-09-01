@@ -470,6 +470,7 @@ async function checkDynamics(up, settings, old, next, result, env) {
 async function checkAll(env) {
   const settings = await getSettings(env);
   const oldMap = await kvGet(env, 'lastSeen', {});
+  await addLog(env, 'info', '开始检查：' + settings.ups.length + ' 个UP主');
   const nextMap = {};
   const result = { videos: [], dynamics: [], errors: [] };
   for (const up of settings.ups) {
@@ -593,8 +594,14 @@ async function handleApi(request, env) {
   }
 
   if (path === '/api/check' && method === 'POST') {
-    const result = await checkAll(env);
-    return json({ ok: true, result: result });
+    try {
+      const result = await checkAll(env);
+      return json({ ok: true, result: result });
+    } catch (e) {
+      const msg = '手动检查失败：' + String(e && e.message || e);
+      try { await addLog(env, 'error', msg); } catch (_) {}
+      return json({ ok: false, error: msg }, 500);
+    }
   }
 
   if (path === '/api/test-wecom' && method === 'POST') {
@@ -698,7 +705,7 @@ const UI_HTML = [
 "function saveSettings(){var data=collectSettings();api(\"/api/settings\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){if(j.ok){toast(\"已保存\");state.settings=j.settings||data;renderUps();}else{toast(j.error||\"保存失败\");}}).catch(function(){toast(\"保存失败\");});}",
 "function addUp(){var mid=$(\"newMid\").value.trim();var name=$(\"newName\").value.trim();if(!mid){toast(\"请输入UID或链接\");return;}api(\"/api/ups\",{method:\"POST\",body:JSON.stringify({mid:mid,name:name})}).then(function(j){if(j.ok){toast(\"已添加\");$(\"newMid\").value=\"\";$(\"newName\").value=\"\";loadSettings();}else{toast(j.error||\"添加失败\");}}).catch(function(){toast(\"添加失败\");});}",
 "function deleteUp(id){if(!confirm(\"确认删除该UP主？\"))return;api(\"/api/ups/delete\",{method:\"POST\",body:JSON.stringify({id:id})}).then(function(j){if(j.ok){toast(\"已删除\");loadSettings();}else{toast(j.error||\"删除失败\");}}).catch(function(){toast(\"删除失败\");});}",
-"function runNow(){api(\"/api/check\",{method:\"POST\"}).then(function(j){toast(j.ok?\"检查完成\":\"检查失败\");loadLogs();}).catch(function(){toast(\"检查失败\");});}",
+"function runNow(){api(\"/api/check\",{method:\"POST\"}).then(function(j){toast(j.ok?\"检查完成\":(j.error||\"检查失败\"));loadLogs();}).catch(function(){toast(\"检查失败\");loadLogs();});}",
 "function testWecom(){var data=collectSettings();api(\"/api/test-wecom\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"企微测试成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}",
 "function testWebdav(){var data=collectSettings();api(\"/api/test-webdav\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"WebDAV连接成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}",
 "function clearLogs(){if(!confirm(\"确认清除所有运行日志？\"))return;api(\"/api/logs/clear\",{method:\"POST\"}).then(function(j){if(j.ok){toast(\"日志已清除\");loadLogs();}else{toast(j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}",
