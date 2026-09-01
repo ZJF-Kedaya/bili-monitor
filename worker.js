@@ -7,6 +7,7 @@ const DEFAULT_SETTINGS = {
   webdavUser: '',
   webdavPass: '',
   downloadApi: 'https://bili.kedaya.gq/api/download?url=',
+  rsshubBase: 'https://rsshub.liumingye.cn',
   intervalMinutes: 5,
   notifyOnFirstRun: false,
   ups: []
@@ -115,6 +116,76 @@ async function getFingerCookie(cookie) {
   }
 }
 
+function stripRssHtml(s){ return String(s || '').replace(/<[^>]*>/g, ''); }
+function decodeXmlEntities(s){ return String(s || '').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&'); }
+function extractBvid(s){ var m = String(s || '').match(/(BV[0-9A-Za-z]+)/); return m ? m[1] : ''; }
+function parseRssItems(xml){
+  var out = [];
+  var raw = String(xml || '');
+  var pieces = raw.split('<item');
+  for (var i = 1; i < pieces.length; i++){
+    var chunk = pieces[i];
+    var gt = chunk.indexOf('>');
+    if (gt < 0) continue;
+    chunk = chunk.slice(gt + 1);
+    var close = chunk.indexOf('</item>');
+    if (close >= 0) chunk = chunk.slice(0, close);
+    function readTag(tag){
+      var open = '<' + tag;
+      var start = chunk.indexOf(open);
+      if (start < 0) return '';
+      var tail = chunk.slice(start);
+      var endTag = '</' + tag + '>';
+      var bodyStart = tail.indexOf('>');
+      var bodyEnd = tail.indexOf(endTag);
+      if (bodyStart < 0 || bodyEnd < 0) return '';
+      return tail.slice(bodyStart + 1, bodyEnd);
+    }
+    out.push({ title: readTag('title'), link: readTag('link'), guid: readTag('guid'), description: readTag('description'), pubDate: readTag('pubDate') });
+  }
+  return out;
+}
+async function fetchRssVideos(mid, base){
+  var root = String(base || '');
+  while (root.slice(-1) === '/') root = root.slice(0, -1);
+  if (!root) throw new Error('未配置RSSHub地址');
+  var url = root + '/bilibili/user/video/' + encodeURIComponent(String(mid));
+  var resp = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/rss+xml, application/xml, text/xml, */*' } });
+  if (!resp.ok) throw new Error('RSSHub HTTP ' + resp.status);
+  var xml = await resp.text();
+  var items = parseRssItems(xml);
+  var vlist = [];
+  for (var k = 0; k < items.length; k++){
+    var bvid = extractBvid(items[k].link || items[k].guid);
+    if (bvid) vlist.push({ bvid: bvid, title: decodeXmlEntities(stripRssHtml(items[k].title)) || bvid, created: 0, author: '' });
+  }
+  if (!vlist.length) throw new Error('RSSHub未解析到视频');
+  return { code: 0, message: '0', data: { list: { vlist: vlist } } };
+}
+async function fetchRssDynamics(mid, base){
+  var root = String(base || '');
+  while (root.slice(-1) === '/') root = root.slice(0, -1);
+  if (!root) throw new Error('未配置RSSHub地址');
+  var url = root + '/bilibili/user/dynamic/' + encodeURIComponent(String(mid));
+  var resp = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/rss+xml, application/xml, text/xml, */*' } });
+  if (!resp.ok) throw new Error('RSSHub HTTP ' + resp.status);
+  var xml = await resp.text();
+  var rssItems = parseRssItems(xml);
+  var items = [];
+  for (var k = 0; k < rssItems.length; k++){
+    var link = rssItems[k].link || rssItems[k].guid || '';
+    var idMatch = String(link).match(/([0-9]{6,})/);
+    var id = idMatch ? idMatch[1] : '';
+    var bvid = extractBvid(link);
+    var text = decodeXmlEntities(stripRssHtml(rssItems[k].title || rssItems[k].description || ''));
+    var archive = null;
+    if (bvid) archive = { bvid: bvid, title: decodeXmlEntities(stripRssHtml(rssItems[k].title || '')) };
+    items.push({ id_str: id, id: id, type: '动态', modules: { module_author: { name: '' }, module_dynamic: { desc: { text: text }, major: { archive: archive } } } });
+  }
+  if (!items.length) throw new Error('RSSHub未解析到动态');
+  return { code: 0, message: '0', data: { items: items } };
+}
+
 function getMixinKey(orig) {
   return MIXIN_TAB.map(function (i) { return orig[i]; }).join('').slice(0, 32);
 }
@@ -141,33 +212,35 @@ function encodeWbi(params, mixinKey) {
   return query + '&w_rid=' + md5(query + mixinKey);
 }
 
-async function fetchVideos(mid, cookie) {
+async function fetchVideos(mid, cookie, rsshubBase) {
   const cookie2 = await getFingerCookie(cookie);
   const params = { mid: String(mid), ps: '10', pn: '1', tid: '0', keyword: '', order: 'pubdate' };
   try {
     const keys = await getWbiKeys(cookie2);
     const mixin = getMixinKey(keys.img + keys.sub);
     const query = encodeWbi(params, mixin);
-    const resp = await fetch('https://api.bilibili.com/x/space/wbi/arc/search?' + query, {
-      headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/video')
-    });
-    return await resp.json();
-  } catch (e) {
+    const resp = await fetch('https://api.bilibili.com/x/space/wbi/arc/search?' + query, { headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/video') });
+    const data = await resp.json();
+    if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) return data;
+  } catch (e) {}
+  try {
     const query = 'mid=' + encodeURIComponent(String(mid)) + '&ps=10&pn=1&tid=0&keyword=&order=pubdate';
-    const resp = await fetch('https://api.bilibili.com/x/space/arc/search?' + query, {
-      headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/video')
-    });
-    return await resp.json();
-  }
+    const resp = await fetch('https://api.bilibili.com/x/space/arc/search?' + query, { headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/video') });
+    const data = await resp.json();
+    if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) return data;
+  } catch (e) {}
+  return await fetchRssVideos(mid, rsshubBase);
 }
 
-async function fetchDynamics(mid, cookie) {
+async function fetchDynamics(mid, cookie, rsshubBase) {
   const cookie2 = await getFingerCookie(cookie);
-  const url = 'https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=' + encodeURIComponent(String(mid)) + '&timezone_offset=-480&features=itemOpusStyle';
-  const resp = await fetch(url, {
-    headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/dynamic')
-  });
-  return await resp.json();
+  try {
+    const url = 'https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=' + encodeURIComponent(String(mid)) + '&timezone_offset=-480&features=itemOpusStyle';
+    const resp = await fetch(url, { headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/dynamic') });
+    const data = await resp.json();
+    if (data && data.code === 0 && data.data && data.data.items) return data;
+  } catch (e) {}
+  return await fetchRssDynamics(mid, rsshubBase);
 }
 
 async function kvGet(env, key, def) {
@@ -330,7 +403,7 @@ async function handleDynamic(item, up, settings, env) {
 }
 
 async function checkVideos(up, settings, old, next, result, env) {
-  const data = await fetchVideos(up.mid, settings.cookie);
+  const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase);
   if (!data || data.code !== 0 || !data.data) throw new Error('视频接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const list = (data.data.list && data.data.list.vlist) || [];
   const first = list[0];
@@ -338,11 +411,7 @@ async function checkVideos(up, settings, old, next, result, env) {
   if (!old.video) {
     next.video = first.bvid;
     next.videoTitle = first.title || '';
-    if (settings.notifyOnFirstRun && up.notify !== false) {
-      await handleVideo(first, up, settings, env);
-    } else {
-      await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次运行，已记录视频基线：' + (first.title || first.bvid));
-    }
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次成功解析，已记录视频基线，不下载：' + (first.title || first.bvid));
     return;
   }
   const fresh = [];
@@ -367,7 +436,7 @@ async function checkVideos(up, settings, old, next, result, env) {
 }
 
 async function checkDynamics(up, settings, old, next, result, env) {
-  const data = await fetchDynamics(up.mid, settings.cookie);
+  const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase);
   if (!data || data.code !== 0 || !data.data) throw new Error('动态接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const items = data.data.items || [];
   const first = items[0];
@@ -375,11 +444,7 @@ async function checkDynamics(up, settings, old, next, result, env) {
   const firstId = String(first.id_str || first.id || '');
   if (!old.dyn) {
     next.dyn = firstId;
-    if (settings.notifyOnFirstRun && up.notify !== false) {
-      await handleDynamic(first, up, settings, env);
-    } else {
-      await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次运行，已记录动态基线');
-    }
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次成功解析，已记录动态基线');
     return;
   }
   const fresh = [];
@@ -603,6 +668,7 @@ const UI_HTML = [
 "<label>B站 Cookie（建议粘贴含 SESSDATA 的完整Cookie）</label>",
 "<textarea id=\"cookie\"></textarea>",
 "<div class=\"row\"><div><label>企业微信 Webhook</label><input id=\"wecomWebhook\" placeholder=\"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...\"></div><div><label>下载接口前缀</label><input id=\"downloadApi\"></div></div>",
+"<div class=\"row\"><div><label>RSSHub 实例地址</label><input id=\"rsshubBase\" placeholder=\"https://rsshub.liumingye.cn\"></div><div></div></div>",
 "<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"webdavUrl\" placeholder=\"https://dav.example.com/dav/\"></div><div><label>检查间隔（分钟）</label><input id=\"intervalMinutes\" type=\"number\" min=\"1\"></div></div>",
 "<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"webdavUser\"></div><div><label>WebDAV 密码</label><input id=\"webdavPass\" type=\"password\"></div></div>",
 "<label class=\"check\"><input id=\"notifyOnFirstRun\" type=\"checkbox\"> 首次运行时也推送已存在的视频/动态</label>",
@@ -623,8 +689,8 @@ const UI_HTML = [
 "function $(id){return document.getElementById(id);}",
 "function toast(msg){var el=$(\"toast\");el.textContent=msg;el.className=\"toast show\";setTimeout(function(){el.className=\"toast\";},2200);}",
 "function api(path,opts){opts=opts||{};opts.headers=Object.assign({\"Content-Type\":\"application/json\"},opts.headers||{});return fetch(path,opts).then(function(r){return r.json();});}",
-"function collectSettings(){return {cookie:$(\"cookie\").value,wecomWebhook:$(\"wecomWebhook\").value,downloadApi:$(\"downloadApi\").value,webdavUrl:$(\"webdavUrl\").value,webdavUser:$(\"webdavUser\").value,webdavPass:$(\"webdavPass\").value,intervalMinutes:Number($(\"intervalMinutes\").value)||5,notifyOnFirstRun:!!$(\"notifyOnFirstRun\").checked,ups:state.settings?state.settings.ups:[]};}",
-"function fillSettings(s){state.settings=s;$(\"cookie\").value=s.cookie||\"\";$(\"wecomWebhook\").value=s.wecomWebhook||\"\";$(\"downloadApi\").value=s.downloadApi||\"https://bili.kedaya.gq/api/download?url=\";$(\"webdavUrl\").value=s.webdavUrl||\"\";$(\"webdavUser\").value=s.webdavUser||\"\";$(\"webdavPass\").value=s.webdavPass||\"\";$(\"intervalMinutes\").value=s.intervalMinutes||5;$(\"notifyOnFirstRun\").checked=!!s.notifyOnFirstRun;renderUps();}",
+"function collectSettings(){return {cookie:$(\"cookie\").value,wecomWebhook:$(\"wecomWebhook\").value,downloadApi:$(\"downloadApi\").value,rsshubBase:$(\"rsshubBase\").value,webdavUrl:$(\"webdavUrl\").value,webdavUser:$(\"webdavUser\").value,webdavPass:$(\"webdavPass\").value,intervalMinutes:Number($(\"intervalMinutes\").value)||5,notifyOnFirstRun:!!$(\"notifyOnFirstRun\").checked,ups:state.settings?state.settings.ups:[]};}",
+"function fillSettings(s){state.settings=s;$(\"cookie\").value=s.cookie||\"\";$(\"wecomWebhook\").value=s.wecomWebhook||\"\";$(\"downloadApi\").value=s.downloadApi||\"https://bili.kedaya.gq/api/download?url=\";$(\"rsshubBase\").value=s.rsshubBase||\"https://rsshub.liumingye.cn\";$(\"webdavUrl\").value=s.webdavUrl||\"\";$(\"webdavUser\").value=s.webdavUser||\"\";$(\"webdavPass\").value=s.webdavPass||\"\";$(\"intervalMinutes\").value=s.intervalMinutes||5;$(\"notifyOnFirstRun\").checked=!!s.notifyOnFirstRun;renderUps();}",
 "function makeTd(text){var td=document.createElement(\"td\");td.textContent=text;return td;}",
 "function makeCheck(checked,onChange){var td=document.createElement(\"td\");var input=document.createElement(\"input\");input.type=\"checkbox\";input.checked=!!checked;input.addEventListener(\"change\",function(e){onChange(e.target.checked);});td.appendChild(input);return td;}",
 "function renderUps(){var tb=$(\"upList\");tb.innerHTML=\"\";(state.settings.ups||[]).forEach(function(u){var tr=document.createElement(\"tr\");tr.appendChild(makeTd(u.name||\"未命名\"));tr.appendChild(makeTd(u.mid));tr.appendChild(makeCheck(u.monitorVideo!==false,function(v){u.monitorVideo=v;}));tr.appendChild(makeCheck(u.monitorDynamic!==false,function(v){u.monitorDynamic=v;}));tr.appendChild(makeCheck(u.notify!==false,function(v){u.notify=v;}));tr.appendChild(makeCheck(u.download!==false,function(v){u.download=v;}));var del=document.createElement(\"button\");del.textContent=\"删除\";del.className=\"gray\";del.style.marginTop=\"0\";del.addEventListener(\"click\",function(){deleteUp(u.id);});var td=document.createElement(\"td\");td.appendChild(del);tr.appendChild(td);tb.appendChild(tr);});}",
