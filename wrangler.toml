@@ -7,5 +7,5 @@ workers_dev = true
 crons = ["* * * * *"]
 
 [[kv_namespaces]]
-binding = "BILI_MONITOR_KV"
-id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+binding = "bili_monitor"
+id = "b1323de1990543029f152c6e82010509"
