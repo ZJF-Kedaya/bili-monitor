@@ -92,6 +92,29 @@ function biliHeaders(cookie, referer) {
   };
 }
 
+async function getFingerCookie(cookie) {
+  const old = String(cookie || '');
+  try {
+    const resp = await fetch('https://api.bilibili.com/x/frontend/finger/spi', {
+      headers: {
+        'User-Agent': UA,
+        'Referer': 'https://www.bilibili.com/',
+        'Accept': 'application/json, text/plain, */*'
+      }
+    });
+    const j = await resp.json();
+    const b3 = j && j.data && j.data.b_3 ? String(j.data.b_3) : '';
+    const b4 = j && j.data && j.data.b_4 ? String(j.data.b_4) : '';
+    const parts = [];
+    if (b3 && old.indexOf('buvid3=') < 0) parts.push('buvid3=' + b3);
+    if (b4 && old.indexOf('buvid4=') < 0) parts.push('buvid4=' + b4);
+    if (!parts.length) return old;
+    return old ? old + '; ' + parts.join('; ') : parts.join('; ');
+  } catch (e) {
+    return old;
+  }
+}
+
 function getMixinKey(orig) {
   return MIXIN_TAB.map(function (i) { return orig[i]; }).join('').slice(0, 32);
 }
@@ -119,28 +142,30 @@ function encodeWbi(params, mixinKey) {
 }
 
 async function fetchVideos(mid, cookie) {
+  const cookie2 = await getFingerCookie(cookie);
   const params = { mid: String(mid), ps: '10', pn: '1', tid: '0', keyword: '', order: 'pubdate' };
   try {
-    const keys = await getWbiKeys(cookie);
+    const keys = await getWbiKeys(cookie2);
     const mixin = getMixinKey(keys.img + keys.sub);
     const query = encodeWbi(params, mixin);
     const resp = await fetch('https://api.bilibili.com/x/space/wbi/arc/search?' + query, {
-      headers: biliHeaders(cookie, 'https://space.bilibili.com/' + String(mid) + '/video')
+      headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/video')
     });
     return await resp.json();
   } catch (e) {
     const query = 'mid=' + encodeURIComponent(String(mid)) + '&ps=10&pn=1&tid=0&keyword=&order=pubdate';
     const resp = await fetch('https://api.bilibili.com/x/space/arc/search?' + query, {
-      headers: biliHeaders(cookie, 'https://space.bilibili.com/' + String(mid) + '/video')
+      headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/video')
     });
     return await resp.json();
   }
 }
 
 async function fetchDynamics(mid, cookie) {
+  const cookie2 = await getFingerCookie(cookie);
   const url = 'https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=' + encodeURIComponent(String(mid)) + '&timezone_offset=-480&features=itemOpusStyle';
   const resp = await fetch(url, {
-    headers: biliHeaders(cookie, 'https://space.bilibili.com/' + String(mid) + '/dynamic')
+    headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/dynamic')
   });
   return await resp.json();
 }
@@ -306,7 +331,7 @@ async function handleDynamic(item, up, settings, env) {
 
 async function checkVideos(up, settings, old, next, result, env) {
   const data = await fetchVideos(up.mid, settings.cookie);
-  if (!data || data.code !== 0 || !data.data) throw new Error((data && data.message) || '视频接口返回异常');
+  if (!data || data.code !== 0 || !data.data) throw new Error('视频接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const list = (data.data.list && data.data.list.vlist) || [];
   const first = list[0];
   if (!first) return;
@@ -343,7 +368,7 @@ async function checkVideos(up, settings, old, next, result, env) {
 
 async function checkDynamics(up, settings, old, next, result, env) {
   const data = await fetchDynamics(up.mid, settings.cookie);
-  if (!data || data.code !== 0 || !data.data) throw new Error((data && data.message) || '动态接口返回异常');
+  if (!data || data.code !== 0 || !data.data) throw new Error('动态接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const items = data.data.items || [];
   const first = items[0];
   if (!first) return;
