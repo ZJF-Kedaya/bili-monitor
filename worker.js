@@ -666,6 +666,26 @@ if (path === '/api/overview' && method === 'GET') {
     return json({ ok: true, latest: overviewData.latest });
   }
 
+if (path === '/api/ups/clear-video' && method === 'POST') {
+    const body = await readJson(request);
+    if (!body || (!body.id && !body.mid)) return json({ ok: false, error: '缺少id或mid' }, 400);
+    const settings = await getSettings(env);
+    let mid = body.mid;
+    if (!mid) {
+      const up = settings.ups.find(function(u){ return u.id === body.id; });
+      if (!up) return json({ ok: false, error: '未找到UP主' }, 404);
+      mid = up.mid;
+    }
+    const last = await kvGet(env, 'lastSeen', {});
+    const cur = last[mid] || {};
+    cur.video = '';
+    cur.videoTitle = '';
+    last[mid] = cur;
+    await kvPut(env, 'lastSeen', last);
+    await addLog(env, 'info', '[' + String(mid) + '] 已清除视频与最新视频信息');
+    return json({ ok: true });
+  }
+
 if (path === '/api/logs' && method === 'GET') {
     const logs = await kvGet(env, 'logs', []);
     return json({ ok: true, logs: logs });
@@ -782,7 +802,9 @@ const UI_HTML = [
 "function fillSettings(s){state.settings=s;$(\"cookie\").value=s.cookie||\"\";$(\"wecomWebhook\").value=s.wecomWebhook||\"\";$(\"downloadApi\").value=s.downloadApi||\"https://bili.kedaya.gq/api/download?url=\";$(\"rsshubBase\").value=s.rsshubBase||\"https://rsshub.liumingye.cn\";$(\"webdavUrl\").value=s.webdavUrl||\"\";$(\"webdavUser\").value=s.webdavUser||\"\";$(\"webdavPass\").value=s.webdavPass||\"\";$(\"intervalMinutes\").value=s.intervalMinutes||5;$(\"notifyOnFirstRun\").checked=!!s.notifyOnFirstRun;renderUps();}",
 "function makeTd(text){var td=document.createElement(\"td\");td.textContent=text;return td;}",
 "function makeCheck(checked,onChange){var td=document.createElement(\"td\");var input=document.createElement(\"input\");input.type=\"checkbox\";input.checked=!!checked;input.addEventListener(\"change\",function(e){onChange(e.target.checked);});td.appendChild(input);return td;}",
-"function renderUps(){var tb=$(\"upList\");tb.innerHTML=\"\";(state.settings.ups||[]).forEach(function(u){var tr=document.createElement(\"tr\");tr.appendChild(makeTd(u.name||\"未命名\"));tr.appendChild(makeTd(u.mid));var info=(state.latest&&state.latest[u.mid])||{};var latestTd=document.createElement(\"td\");if(info.video){var a=document.createElement(\"a\");a.textContent=info.videoTitle||info.video;a.href=\"https://www.bilibili.com/video/\"+encodeURIComponent(info.video);a.target=\"_blank\";a.rel=\"noopener\";latestTd.appendChild(a);}else{latestTd.textContent=\"暂无\";}tr.appendChild(latestTd);tr.appendChild(makeCheck(u.monitorVideo!==false,function(v){u.monitorVideo=v;}));tr.appendChild(makeCheck(u.monitorDynamic!==false,function(v){u.monitorDynamic=v;}));tr.appendChild(makeCheck(u.notify!==false,function(v){u.notify=v;}));tr.appendChild(makeCheck(u.download!==false,function(v){u.download=v;}));var del=document.createElement(\"button\");del.textContent=\"删除\";del.className=\"gray\";del.style.marginTop=\"0\";del.addEventListener(\"click\",function(){deleteUp(u.id);});var td=document.createElement(\"td\");td.appendChild(del);tr.appendChild(td);tb.appendChild(tr);});}",
+"function updateUpFlag(id,field,val){var patch={};patch[field]=val;api(\"/api/ups/update\",{method:\"POST\",body:JSON.stringify({id:id,patch:patch})}).then(function(j){if(!j||!j.ok){toast(j&&j.error||\"更新失败\");return;}var u=(state.settings.ups||[]).find(function(x){return x.id===id;});if(u){u[field]=val;}renderUps();}).catch(function(){toast(\"更新失败\");});}",
+"function clearUpVideo(id,mid){if(!confirm(\"确认清除该UP主的视频与最新视频信息？\"))return;api(\"/api/ups/clear-video\",{method:\"POST\",body:JSON.stringify({id:id,mid:mid})}).then(function(j){if(j&&j.ok){toast(\"已清除\");loadOverview();}else{toast(j&&j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}",
+"function renderUps(){var tb=$(\"upList\");tb.innerHTML=\"\";(state.settings.ups||[]).forEach(function(u){var tr=document.createElement(\"tr\");tr.appendChild(makeTd(u.name||\"未命名\"));tr.appendChild(makeTd(u.mid));var info=(state.latest&&state.latest[u.mid])||{};var latestTd=document.createElement(\"td\");if(info.video){var a=document.createElement(\"a\");a.textContent=info.videoTitle||info.video;a.href=\"https://www.bilibili.com/video/\"+encodeURIComponent(info.video);a.target=\"_blank\";a.rel=\"noopener\";latestTd.appendChild(a);}else{latestTd.textContent=\"暂无\";}tr.appendChild(latestTd);tr.appendChild(makeCheck(u.monitorVideo!==false,function(v){u.monitorVideo=v;updateUpFlag(u.id,\"monitorVideo\",v);}));tr.appendChild(makeCheck(u.monitorDynamic!==false,function(v){u.monitorDynamic=v;updateUpFlag(u.id,\"monitorDynamic\",v);}));tr.appendChild(makeCheck(u.notify!==false,function(v){u.notify=v;updateUpFlag(u.id,\"notify\",v);}));tr.appendChild(makeCheck(u.download!==false,function(v){u.download=v;updateUpFlag(u.id,\"download\",v);}));var actTd=document.createElement(\"td\");var clearBtn=document.createElement(\"button\");clearBtn.textContent=\"清除视频信息\";clearBtn.className=\"gray\";clearBtn.style.marginTop=\"0\";clearBtn.style.marginRight=\"6px\";clearBtn.addEventListener(\"click\",function(){clearUpVideo(u.id,u.mid);});actTd.appendChild(clearBtn);var del=document.createElement(\"button\");del.textContent=\"删除\";del.className=\"gray\";del.style.marginTop=\"0\";del.addEventListener(\"click\",function(){deleteUp(u.id);});actTd.appendChild(del);tr.appendChild(actTd);tb.appendChild(tr);});}",
 "function debugNow(){var btn=$(\"debugBtn\");btn.disabled=true;var box=$(\"debugBox\");api(\"/api/debug\").then(function(j){if(!j||!j.ok){box.textContent=\"调试失败：\"+(j&&j.error||\"\");}else{box.textContent=JSON.stringify(j.debug||j,null,2);}box.style.display=\"block\";toast(j&&j.ok?\"调试完成\":\"调试失败\");}).catch(function(){box.textContent=\"调试请求失败\";box.style.display=\"block\";toast(\"调试请求失败\");}).finally(function(){btn.disabled=false;});}",
 "function loadOverview(){api(\"/api/overview\").then(function(j){if(j&&j.ok){state.latest=j.latest||{};renderUps();}}).catch(function(){});}",
 "function loadSettings(){api(\"/api/settings\").then(function(j){if(j&&j.ok){fillSettings(j.settings||{});}else{toast((j&&j.error)||\"加载失败\");}}).catch(function(){toast(\"加载失败\");});}",
