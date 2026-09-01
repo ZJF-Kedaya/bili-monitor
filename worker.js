@@ -517,6 +517,11 @@ async function handleApi(request, env) {
     return json({ ok: true });
   }
 
+  if (path === '/api/logs/clear' && method === 'POST') {
+    await env.BILI_MONITOR_KV.delete('logs');
+    return json({ ok: true });
+  }
+
   if (path === '/api/logs' && method === 'GET') {
     const logs = await kvGet(env, 'logs', []);
     return json({ ok: true, logs: logs });
@@ -608,7 +613,7 @@ const UI_HTML = [
 "<button id=\"addBtn\">添加UP主</button>",
 "<table style=\"margin-top:14px\"><thead><tr><th>UP主</th><th>UID</th><th>视频</th><th>动态</th><th>通知</th><th>下载</th><th></th></tr></thead><tbody id=\"upList\"></tbody></table>",
 "</div>",
-"<div class=\"card\"><div style=\"display:flex;justify-content:space-between;align-items:center\"><h2>运行日志</h2><div><button id=\"runBtn\">立即检查</button> <button id=\"refreshLogsBtn\" class=\"gray\">刷新日志</button></div></div>",
+"<div class=\"card\"><div style=\"display:flex;justify-content:space-between;align-items:center\"><h2>运行日志</h2><div><button id=\"runBtn\">立即检查</button> <button id=\"refreshLogsBtn\" class=\"gray\">刷新日志</button> <button id=\"clearLogsBtn\" class=\"gray\">清除日志</button></div></div>",
 "<div id=\"logs\" class=\"log\">加载中...</div>",
 "</div>",
 "</div>",
@@ -630,11 +635,13 @@ const UI_HTML = [
 "function runNow(){api(\"/api/check\",{method:\"POST\"}).then(function(j){toast(j.ok?\"检查完成\":\"检查失败\");loadLogs();}).catch(function(){toast(\"检查失败\");});}",
 "function testWecom(){var data=collectSettings();api(\"/api/test-wecom\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"企微测试成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}",
 "function testWebdav(){var data=collectSettings();api(\"/api/test-webdav\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"WebDAV连接成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}",
+"function clearLogs(){if(!confirm(\"确认清除所有运行日志？\"))return;api(\"/api/logs/clear\",{method:\"POST\"}).then(function(j){if(j.ok){toast(\"日志已清除\");loadLogs();}else{toast(j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}",
 "function loadLogs(){api(\"/api/logs\").then(function(j){var box=$(\"logs\");box.innerHTML=\"\";if(!j||!j.ok){box.textContent=\"加载失败\";return;}var logs=j.logs||[];if(!logs.length){box.textContent=\"暂无日志\";return;}logs.forEach(function(l){var div=document.createElement(\"div\");div.className=l.level||\"info\";var t=new Date(l.t).toLocaleString(\"zh-CN\",{hour12:false});div.textContent=\"[\"+t+\"] \"+l.msg;box.appendChild(div);});}).catch(function(){var box=$(\"logs\");box.textContent=\"加载失败\";});}",
 "$(\"saveBtn\").addEventListener(\"click\",saveSettings);",
 "$(\"addBtn\").addEventListener(\"click\",addUp);",
 "$(\"runBtn\").addEventListener(\"click\",runNow);",
 "$(\"refreshLogsBtn\").addEventListener(\"click\",loadLogs);",
+"$(\"clearLogsBtn\").addEventListener(\"click\",clearLogs);",
 "$(\"testWecomBtn\").addEventListener(\"click\",testWecom);",
 "$(\"testWebdavBtn\").addEventListener(\"click\",testWebdav);",
 "loadSettings();loadLogs();setInterval(function(){loadLogs();},15000);",
