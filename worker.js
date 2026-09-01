@@ -145,45 +145,89 @@ function parseRssItems(xml){
   }
   return out;
 }
-async function fetchRssVideos(mid, base){
-  var root = String(base || '');
-  while (root.slice(-1) === '/') root = root.slice(0, -1);
-  if (!root) throw new Error('未配置RSSHub地址');
-  var url = root + '/bilibili/user/video/' + encodeURIComponent(String(mid));
-  var resp = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/rss+xml, application/xml, text/xml, */*' } });
-  if (!resp.ok) throw new Error('RSSHub HTTP ' + resp.status);
-  var xml = await resp.text();
-  var items = parseRssItems(xml);
-  var vlist = [];
-  for (var k = 0; k < items.length; k++){
-    var bvid = extractBvid(items[k].link || items[k].guid);
-    if (bvid) vlist.push({ bvid: bvid, title: decodeXmlEntities(stripRssHtml(items[k].title)) || bvid, created: 0, author: '' });
+
+function getRsshubBases(raw) {
+  var s = String(raw || DEFAULT_SETTINGS.rsshubBase || '');
+  var parts = s.split(/[\r\n,]+/);
+  var out = [];
+  for (var i = 0; i < parts.length; i++) {
+    var b = String(parts[i] || '').trim();
+    while (b.slice(-1) === '/') b = b.slice(0, -1);
+    if (b && /^https?:\/\//i.test(b) && out.indexOf(b) < 0) out.push(b);
   }
-  if (!vlist.length) throw new Error('RSSHub未解析到视频');
-  return { code: 0, message: '0', data: { list: { vlist: vlist } } };
+  return out;
 }
-async function fetchRssDynamics(mid, base){
-  var root = String(base || '');
-  while (root.slice(-1) === '/') root = root.slice(0, -1);
-  if (!root) throw new Error('未配置RSSHub地址');
-  var url = root + '/bilibili/user/dynamic/' + encodeURIComponent(String(mid));
-  var resp = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/rss+xml, application/xml, text/xml, */*' } });
-  if (!resp.ok) throw new Error('RSSHub HTTP ' + resp.status);
-  var xml = await resp.text();
-  var rssItems = parseRssItems(xml);
-  var items = [];
-  for (var k = 0; k < rssItems.length; k++){
-    var link = rssItems[k].link || rssItems[k].guid || '';
-    var idMatch = String(link).match(/([0-9]{6,})/);
-    var id = idMatch ? idMatch[1] : '';
-    var bvid = extractBvid(link);
-    var text = decodeXmlEntities(stripRssHtml(rssItems[k].title || rssItems[k].description || ''));
-    var archive = null;
-    if (bvid) archive = { bvid: bvid, title: decodeXmlEntities(stripRssHtml(rssItems[k].title || '')) };
-    items.push({ id_str: id, id: id, type: '动态', modules: { module_author: { name: '' }, module_dynamic: { desc: { text: text }, major: { archive: archive } } } });
+
+async function updatePreferredRsshub(env, base) {
+  if (!env || !base) return;
+  try {
+    var settings = await getSettings(env);
+    var bases = getRsshubBases(settings.rsshubBase);
+    if (!bases.length || bases[0] === base) return;
+    var next = [base];
+    for (var i = 0; i < bases.length; i++) if (bases[i] !== base) next.push(bases[i]);
+    settings.rsshubBase = next.join('\n');
+    await saveSettings(env, settings);
+  } catch (e) {}
+}
+
+async function fetchRssVideos(mid, rawBases, env){
+  var bases = getRsshubBases(rawBases);
+  if (!bases.length) throw new Error('未配置RSSHub地址');
+  var lastErr = '';
+  for (var i = 0; i < bases.length; i++){
+    var root = bases[i];
+    try {
+      var url = root + '/bilibili/user/video/' + encodeURIComponent(String(mid));
+      var resp = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/rss+xml, application/xml, text/xml, */*' } });
+      if (!resp.ok) throw new Error('RSSHub HTTP ' + resp.status);
+      var xml = await resp.text();
+      var items = parseRssItems(xml);
+      var vlist = [];
+      for (var k = 0; k < items.length; k++){
+        var bvid = extractBvid(items[k].link || items[k].guid);
+        if (bvid) vlist.push({ bvid: bvid, title: decodeXmlEntities(stripRssHtml(items[k].title)) || bvid, created: 0, author: '' });
+      }
+      if (!vlist.length) throw new Error('RSSHub未解析到视频');
+      await updatePreferredRsshub(env, root);
+      return { base: root, data: { code: 0, message: '0', data: { list: { vlist: vlist } } } };
+    } catch (e) {
+      lastErr = String(e && e.message || e);
+    }
   }
-  if (!items.length) throw new Error('RSSHub未解析到动态');
-  return { code: 0, message: '0', data: { items: items } };
+  throw new Error('所有RSSHub实例均不可用，最后错误：' + lastErr);
+}
+async function fetchRssDynamics(mid, rawBases, env){
+  var bases = getRsshubBases(rawBases);
+  if (!bases.length) throw new Error('未配置RSSHub地址');
+  var lastErr = '';
+  for (var i = 0; i < bases.length; i++){
+    var root = bases[i];
+    try {
+      var url = root + '/bilibili/user/dynamic/' + encodeURIComponent(String(mid));
+      var resp = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'application/rss+xml, application/xml, text/xml, */*' } });
+      if (!resp.ok) throw new Error('RSSHub HTTP ' + resp.status);
+      var xml = await resp.text();
+      var rssItems = parseRssItems(xml);
+      var items = [];
+      for (var k = 0; k < rssItems.length; k++){
+        var link = rssItems[k].link || rssItems[k].guid || '';
+        var idMatch = String(link).match(/([0-9]{6,})/);
+        var id = idMatch ? idMatch[1] : '';
+        var bvid = extractBvid(link);
+        var text = decodeXmlEntities(stripRssHtml(rssItems[k].title || rssItems[k].description || ''));
+        var archive = null;
+        if (bvid) archive = { bvid: bvid, title: decodeXmlEntities(stripRssHtml(rssItems[k].title || '')) };
+        items.push({ id_str: id, id: id, type: '动态', modules: { module_author: { name: '' }, module_dynamic: { desc: { text: text }, major: { archive: archive } } } });
+      }
+      if (!items.length) throw new Error('RSSHub未解析到动态');
+      await updatePreferredRsshub(env, root);
+      return { base: root, data: { code: 0, message: '0', data: { items: items } } };
+    } catch (e) {
+      lastErr = String(e && e.message || e);
+    }
+  }
+  throw new Error('所有RSSHub实例均不可用，最后错误：' + lastErr);
 }
 
 function getMixinKey(orig) {
@@ -212,7 +256,7 @@ function encodeWbi(params, mixinKey) {
   return query + '&w_rid=' + md5(query + mixinKey);
 }
 
-async function fetchVideos(mid, cookie, rsshubBase) {
+async function fetchVideos(mid, cookie, rsshubBase, env) {
   const cookie2 = await getFingerCookie(cookie);
   const params = { mid: String(mid), ps: '10', pn: '1', tid: '0', keyword: '', order: 'pubdate' };
   try {
@@ -229,10 +273,11 @@ async function fetchVideos(mid, cookie, rsshubBase) {
     const data = await resp.json();
     if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) return data;
   } catch (e) {}
-  return await fetchRssVideos(mid, rsshubBase);
+  var rssRes = await fetchRssVideos(mid, rsshubBase, env);
+  return rssRes.data;
 }
 
-async function fetchDynamics(mid, cookie, rsshubBase) {
+async function fetchDynamics(mid, cookie, rsshubBase, env) {
   const cookie2 = await getFingerCookie(cookie);
   try {
     const url = 'https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=' + encodeURIComponent(String(mid)) + '&timezone_offset=-480&features=itemOpusStyle';
@@ -240,7 +285,8 @@ async function fetchDynamics(mid, cookie, rsshubBase) {
     const data = await resp.json();
     if (data && data.code === 0 && data.data && data.data.items) return data;
   } catch (e) {}
-  return await fetchRssDynamics(mid, rsshubBase);
+  var rssRes = await fetchRssDynamics(mid, rsshubBase, env);
+  return rssRes.data;
 }
 
 async function kvGet(env, key, def) {
@@ -404,7 +450,7 @@ async function handleDynamic(item, up, settings, env) {
 }
 
 async function checkVideos(up, settings, old, next, result, env) {
-  const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase);
+  const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase, env);
   if (!data || data.code !== 0 || !data.data) throw new Error('视频接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const list = (data.data.list && data.data.list.vlist) || [];
   const first = list[0];
@@ -437,7 +483,7 @@ async function checkVideos(up, settings, old, next, result, env) {
 }
 
 async function checkDynamics(up, settings, old, next, result, env) {
-  const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase);
+  const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env);
   if (!data || data.code !== 0 || !data.data) throw new Error('动态接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const items = data.data.items || [];
   const first = items[0];
@@ -776,7 +822,7 @@ const UI_HTML = [
 "<label>B站 Cookie（建议粘贴含 SESSDATA 的完整Cookie）</label>",
 "<textarea id=\"cookie\"></textarea>",
 "<div class=\"row\"><div><label>企业微信 Webhook</label><input id=\"wecomWebhook\" placeholder=\"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...\"></div><div><label>下载接口前缀</label><input id=\"downloadApi\"></div></div>",
-"<div class=\"row\"><div><label>RSSHub 实例地址</label><input id=\"rsshubBase\" placeholder=\"https://rsshub.liumingye.cn\"></div><div></div></div>",
+"<div class=\"row\"><div><label>RSSHub 实例地址</label><textarea id=\"rsshubBase\" placeholder=\"每行一个地址，例如 https://rsshub.liumingye.cn\"></textarea></div><div></div></div>",
 "<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"webdavUrl\" placeholder=\"https://dav.example.com/dav/\"></div><div><label>检查间隔（分钟）</label><input id=\"intervalMinutes\" type=\"number\" min=\"1\"></div></div>",
 "<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"webdavUser\"></div><div><label>WebDAV 密码</label><input id=\"webdavPass\" type=\"password\"></div></div>",
 "<label class=\"check\"><input id=\"notifyOnFirstRun\" type=\"checkbox\"> 首次运行时也推送已存在的视频/动态</label>",
