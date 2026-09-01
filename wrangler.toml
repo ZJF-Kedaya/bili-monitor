@@ -1,0 +1,11 @@
+name = "bili-up-monitor"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+workers_dev = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[[kv_namespaces]]
+binding = "BILI_MONITOR_KV"
+id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
