@@ -419,8 +419,8 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA } });
   if (!download.ok) throw new Error('下载接口 HTTP ' + download.status);
   if (!download.body) throw new Error('下载接口未返回内容');
-  var folder = encodeURIComponent(String(up.mid) + '_' + (up.name || up.mid));
-  var filename = encodeURIComponent(bvid + '_' + sanitize(title) + '.mp4');
+  var folder = encodeURIComponent(sanitize(up.name || up.mid || String(up.mid)) + '_' + String(up.mid));
+  var filename = encodeURIComponent(sanitize(title) + '_' + bvid + '.mp4');
   var base = String(settings.webdavUrl).replace(/\/+$/, '');
   var dest = base + '/' + folder + '/' + filename;
   var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
@@ -453,6 +453,20 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   } else {
     if (manual) await writeDlProgress(env, { stage: 'upload', message: '上传中...', percent: null });
     upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: download.body });
+  }
+  if (upload.status === 405) {
+    var verifyOk = false;
+    try {
+      var checkHead = await fetch(dest, { method: 'HEAD', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA } });
+      if (checkHead.status >= 200 && checkHead.status < 300) verifyOk = true;
+    } catch (e2) {}
+    if (!verifyOk) {
+      try {
+        var checkProp = await fetch(dest, { method: 'PROPFIND', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Depth': '0' } });
+        if (checkProp.status >= 200 && checkProp.status < 300) verifyOk = true;
+      } catch (e3) {}
+    }
+    if (verifyOk) upload = { status: 207 };
   }
   if (upload.status < 200 || upload.status >= 300) {
     if (manual) await writeDlProgress(env, { stage: 'error', message: 'WebDAV 上传失败 HTTP ' + upload.status, percent: 0 });
