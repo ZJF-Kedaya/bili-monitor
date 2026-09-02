@@ -386,27 +386,81 @@ async function sendWeCom(webhook, kind, author, title, url, env) {
   return data;
 }
 
-async function downloadAndUploadVideo(settings, up, bvid, title, env) {
-  if (!settings.webdavUrl) throw new Error('未配置 WebDAV 地址');
-  const videoUrl = 'https://www.bilibili.com/video/' + bvid;
-  const apiUrl = settings.downloadApi + encodeURIComponent(videoUrl);
-  const download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA } });
-  if (!download.ok) throw new Error('下载接口 HTTP ' + download.status);
-  if (!download.body) throw new Error('下载接口未返回内容');
-  const folder = encodeURIComponent(String(up.mid) + '_' + (up.name || up.mid));
-  const filename = encodeURIComponent(bvid + '_' + sanitize(title) + '.mp4');
-  const base = String(settings.webdavUrl).replace(/\/+$/, '');
-  const dest = base + '/' + folder + '/' + filename;
-  const auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
-  const upload = await fetch(dest, {
-    method: 'PUT',
-    headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA },
-    body: download.body
-  });
-  if (upload.status < 200 || upload.status >= 300) throw new Error('WebDAV 上传失败 HTTP ' + upload.status);
-  await addLog(env, 'info', '[' + (up.name || up.mid) + '] 已上传：' + bvid + '_' + sanitize(title) + '.mp4');
+
+var dlProgressKey = 'dlProgress';
+
+async function writeDlProgress(env, p) {
+  try {
+    await env.BILI_MONITOR_KV.put(dlProgressKey, JSON.stringify(p));
+  } catch (e) {}
 }
 
+async function readDlProgress(env) {
+  try {
+    var raw = await env.BILI_MONITOR_KV.get(dlProgressKey);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function ensureWebdavFolder(base, folder, auth) {
+  try {
+    var url = base + '/' + folder;
+    var r = await fetch(url, { method: 'MKCOL', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA } });
+    if (r.status === 405 || r.status === 409 || r.status === 201 || r.status === 204) return;
+  } catch (e) {}
+}
+async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
+  if (!settings.webdavUrl) throw new Error('未配置 WebDAV 地址');
+  var videoUrl = 'https://www.bilibili.com/video/' + bvid;
+  var apiUrl = settings.downloadApi + encodeURIComponent(videoUrl);
+  if (manual) await writeDlProgress(env, { stage: 'start', message: '准备下载...', percent: 1 });
+  var download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA } });
+  if (!download.ok) throw new Error('下载接口 HTTP ' + download.status);
+  if (!download.body) throw new Error('下载接口未返回内容');
+  var folder = encodeURIComponent(String(up.mid) + '_' + (up.name || up.mid));
+  var filename = encodeURIComponent(bvid + '_' + sanitize(title) + '.mp4');
+  var base = String(settings.webdavUrl).replace(/\/+$/, '');
+  var dest = base + '/' + folder + '/' + filename;
+  var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
+  await ensureWebdavFolder(base, folder, auth);
+  var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' };
+  var upload;
+  if (manual && typeof download.body.tee === 'function') {
+    var branches = download.body.tee();
+    var uploadStream = branches[0];
+    var progressStream = branches[1];
+    var total = Number(download.headers.get('content-length') || 0);
+    var progressPromise = (async function () {
+      var reader = progressStream.getReader();
+      var downloaded = 0;
+      var last = 0;
+      while (true) {
+        var part = await reader.read();
+        if (part.done) break;
+        downloaded += part.value.byteLength || part.value.length || 0;
+        if (Date.now() - last > 1000) {
+          last = Date.now();
+          var pct = total ? Math.min(99, Math.round((downloaded / total) * 85) + 10) : null;
+          await writeDlProgress(env, { stage: 'download', message: '下载中...', bytes: downloaded, total: total, percent: pct });
+        }
+      }
+      await writeDlProgress(env, { stage: 'upload', message: '上传中...', bytes: downloaded, total: total, percent: total ? 90 : null });
+    })();
+    upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: uploadStream });
+    await progressPromise;
+  } else {
+    if (manual) await writeDlProgress(env, { stage: 'upload', message: '上传中...', percent: null });
+    upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: download.body });
+  }
+  if (upload.status < 200 || upload.status >= 300) {
+    if (manual) await writeDlProgress(env, { stage: 'error', message: 'WebDAV 上传失败 HTTP ' + upload.status, percent: 0 });
+    throw new Error('WebDAV 上传失败 HTTP ' + upload.status);
+  }
+  if (manual) await writeDlProgress(env, { stage: 'done', message: '上传完成', percent: 100 });
+  await addLog(env, 'info', '[' + (up.name || up.mid) + '] 已上传：' + bvid + '_' + sanitize(title) + '.mp4');
+}
 function extractDynamicInfo(item) {
   const mod = item && item.modules && item.modules.module_dynamic ? item.modules.module_dynamic : {};
   const author = item && item.modules && item.modules.module_author ? (item.modules.module_author.name || '') : '';
@@ -755,13 +809,18 @@ if (path === '/api/ups/clear-video' && method === 'POST') {
     }
     if (!bvid) return json({ ok: false, error: '未获取到最新视频' }, 400);
     try {
-      await downloadAndUploadVideo(settings, up, bvid, title || bvid, env);
+      await downloadAndUploadVideo(settings, up, bvid, title || bvid, env, true);
       return json({ ok: true, bvid: bvid, title: title || bvid });
     } catch (e) {
       const msg = '手动下载失败：' + String(e.message || e);
       await addLog(env, 'error', msg);
       return json({ ok: false, error: msg }, 500);
     }
+  }
+
+if (path === '/api/download-progress' && method === 'GET') {
+    var p = await readDlProgress(env);
+    return json({ ok: true, progress: p });
   }
 
 if (path === '/api/logs' && method === 'GET') {
@@ -868,6 +927,7 @@ const UI_HTML = [
 "<div class=\"card\"><div style=\"display:flex;justify-content:space-between;align-items:center\"><h2>运行日志</h2><div><button id=\"runBtn\">立即检查</button> <button id=\"refreshLogsBtn\" class=\"gray\">刷新日志</button> <button id=\"clearLogsBtn\" class=\"gray\">清除日志</button> <button id=\"debugBtn\" class=\"gray\">调试</button></div></div>",
 "<div id=\"logs\" class=\"log\">加载中...</div>",
 "<div id=\"debugBox\" style=\"display:none;white-space:pre-wrap;background:#0d1117;color:#d4d8e0;border-radius:8px;padding:12px;max-height:500px;overflow:auto;font:12px Consolas,Menlo,monospace;margin-top:10px\"></div>",
+"<div id=\"dlProgress\" style=\"display:none;white-space:pre-wrap;background:#0d1117;color:#8fb8ff;border-radius:8px;padding:10px 12px;font:13px Consolas,Menlo,monospace;margin-top:10px\"></div>",
 "</div>",
 "</div>",
 "<div id=\"toast\" class=\"toast\"></div>",
@@ -882,7 +942,7 @@ const UI_HTML = [
 "function makeCheck(checked,onChange){var td=document.createElement(\"td\");var input=document.createElement(\"input\");input.type=\"checkbox\";input.checked=!!checked;input.addEventListener(\"change\",function(e){onChange(e.target.checked);});td.appendChild(input);return td;}",
 "function updateUpFlag(id,field,val){var patch={};patch[field]=val;api(\"/api/ups/update\",{method:\"POST\",body:JSON.stringify({id:id,patch:patch})}).then(function(j){if(!j||!j.ok){toast(j&&j.error||\"更新失败\");return;}var u=(state.settings.ups||[]).find(function(x){return x.id===id;});if(u){u[field]=val;}renderUps();}).catch(function(){toast(\"更新失败\");});}",
 "function clearUpVideo(id,mid){if(!confirm(\"确认清除该UP主的视频与最新视频信息？\"))return;api(\"/api/ups/clear-video\",{method:\"POST\",body:JSON.stringify({id:id,mid:mid})}).then(function(j){if(j&&j.ok){toast(\"已清除\");loadOverview();}else{toast(j&&j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}",
-"function manualDownload(id,mid){if(!confirm(\"手动下载当前UP主的最新视频？\"))return;api(\"/api/ups/manual-download\",{method:\"POST\",body:JSON.stringify({id:id,mid:mid})}).then(function(j){if(j&&j.ok){toast(\"手动下载已开始\");}else{toast(j&&j.error||\"下载失败\");}loadLogs();}).catch(function(){toast(\"下载请求失败\");loadLogs();});}",
+"function manualDownload(id,mid){if(!confirm(\"手动下载当前UP主的最新视频？\"))return;var box=$(\"dlProgress\");box.style.display=\"block\";box.textContent=\"准备下载...\";var timer=setInterval(function(){api(\"/api/download-progress\").then(function(j){if(j&&j.ok&&j.progress){box.textContent=(j.progress.message||\"\")+(j.progress.percent?\" (\"+j.progress.percent+\"%)\":\"\");}}).catch(function(){});},1000);api(\"/api/ups/manual-download\",{method:\"POST\",body:JSON.stringify({id:id,mid:mid})}).then(function(j){clearInterval(timer);if(j&&j.ok){box.textContent=\"手动下载成功\";toast(\"手动下载成功\");}else{box.textContent=j&&j.error||\"下载失败\";toast(j&&j.error||\"下载失败\");}loadLogs();loadOverview();}).catch(function(){clearInterval(timer);box.textContent=\"下载请求失败\";toast(\"下载请求失败\");loadLogs();});}",
 "function renderUps(){var tb=$(\"upList\");tb.innerHTML=\"\";(state.settings.ups||[]).forEach(function(u){var tr=document.createElement(\"tr\");tr.appendChild(makeTd(u.name||\"未命名\"));tr.appendChild(makeTd(u.mid));var info=(state.latest&&state.latest[u.mid])||{};var latestTd=document.createElement(\"td\");if(info.video){var a=document.createElement(\"a\");a.textContent=info.videoTitle||info.video;a.href=\"https://www.bilibili.com/video/\"+encodeURIComponent(info.video);a.target=\"_blank\";a.rel=\"noopener\";latestTd.appendChild(a);}else{latestTd.textContent=\"暂无\";}tr.appendChild(latestTd);tr.appendChild(makeCheck(u.monitorVideo!==false,function(v){u.monitorVideo=v;updateUpFlag(u.id,\"monitorVideo\",v);}));tr.appendChild(makeCheck(u.monitorDynamic!==false,function(v){u.monitorDynamic=v;updateUpFlag(u.id,\"monitorDynamic\",v);}));tr.appendChild(makeCheck(u.notify!==false,function(v){u.notify=v;updateUpFlag(u.id,\"notify\",v);}));tr.appendChild(makeCheck(u.download!==false,function(v){u.download=v;updateUpFlag(u.id,\"download\",v);}));var actTd=document.createElement(\"td\");var manualBtn=document.createElement(\"button\");manualBtn.textContent=\"手动下载\";manualBtn.className=\"gray\";manualBtn.style.marginTop=\"0\";manualBtn.style.marginRight=\"6px\";manualBtn.addEventListener(\"click\",function(){manualDownload(u.id,u.mid);});actTd.appendChild(manualBtn);var clearBtn=document.createElement(\"button\");clearBtn.textContent=\"清除视频信息\";clearBtn.className=\"gray\";clearBtn.style.marginTop=\"0\";clearBtn.style.marginRight=\"6px\";clearBtn.addEventListener(\"click\",function(){clearUpVideo(u.id,u.mid);});actTd.appendChild(clearBtn);var del=document.createElement(\"button\");del.textContent=\"删除\";del.className=\"gray\";del.style.marginTop=\"0\";del.addEventListener(\"click\",function(){deleteUp(u.id);});actTd.appendChild(del);tr.appendChild(actTd);tb.appendChild(tr);});}",
 "function debugNow(){var btn=$(\"debugBtn\");btn.disabled=true;var box=$(\"debugBox\");api(\"/api/debug\").then(function(j){if(!j||!j.ok){box.textContent=\"调试失败：\"+(j&&j.error||\"\");}else{box.textContent=JSON.stringify(j.debug||j,null,2);}box.style.display=\"block\";toast(j&&j.ok?\"调试完成\":\"调试失败\");}).catch(function(){box.textContent=\"调试请求失败\";box.style.display=\"block\";toast(\"调试请求失败\");}).finally(function(){btn.disabled=false;});}",
 "function loadOverview(){api(\"/api/overview\").then(function(j){if(j&&j.ok){state.latest=j.latest||{};renderUps();}}).catch(function(){});}",
