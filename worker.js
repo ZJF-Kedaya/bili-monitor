@@ -529,27 +529,35 @@ async function checkVideos(up, settings, old, next, result, env) {
     await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次成功解析，已记录视频基线，不下载：' + (first.title || first.bvid));
     return;
   }
+  const foundOld = list.some(function(item){ return item.bvid === old.video; });
+  if (!foundOld) {
+    next.video = first.bvid;
+    next.videoTitle = first.title || '';
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 最新视频可能已下架或列表变化，已重新记录基线，不触发通知或下载');
+    return;
+  }
   const fresh = [];
   for (const item of list) {
     if (item.bvid === old.video) break;
     fresh.push(item);
   }
-  if (!fresh.length) return;
-  for (let i = fresh.length - 1; i >= 0; i--) {
-    const item = fresh[i];
-    try {
-      await handleVideo(item, up, settings, env);
-      result.videos.push({ up: up.name || up.mid, bvid: item.bvid, title: item.title || '' });
-    } catch (e) {
-      const msg = '[' + (up.name || up.mid) + '] 视频处理失败：' + String(e.message || e);
-      result.errors.push(msg);
-      await addLog(env, 'error', msg);
-    }
+  if (!fresh.length) {
+    next.video = first.bvid;
+    next.videoTitle = first.title || '';
+    return;
+  }
+  const latest = fresh[0];
+  try {
+    await handleVideo(latest, up, settings, env);
+    result.videos.push({ up: up.name || up.mid, bvid: latest.bvid, title: latest.title || '' });
+  } catch (e) {
+    const msg = '[' + (up.name || up.mid) + '] 视频处理失败：' + String(e.message || e);
+    result.errors.push(msg);
+    await addLog(env, 'error', msg);
   }
   next.video = first.bvid;
   next.videoTitle = first.title || '';
 }
-
 async function checkDynamics(up, settings, old, next, result, env) {
   const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env);
   if (!data || data.code !== 0 || !data.data) throw new Error('动态接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
