@@ -545,6 +545,7 @@ async function handleVideo(item, up, settings, env) {
 
 async function handleDynamic(item, up, settings, env) {
   const info = extractDynamicInfo(item);
+  if (!info.bvid) return;
   const url = info.id ? 'https://t.bilibili.com/' + info.id : 'https://space.bilibili.com/' + String(up.mid) + '/dynamic';
   const text = info.text || info.type || '（无文字）';
   if (up.notify !== false && settings.wecomWebhook) {
@@ -613,14 +614,15 @@ async function checkDynamics(up, settings, old, next, result, env) {
     if (String(item.id_str || item.id || '') === old.dyn) break;
     fresh.push(item);
   }
-  if (!fresh.length) return;
-  for (let i = fresh.length - 1; i >= 0; i--) {
-    const item = fresh[i];
+  var videoItems = fresh.filter(function(item) { var info = extractDynamicInfo(item); return !!info.bvid; });
+  if (!videoItems.length) { next.dyn = firstId; return; }
+  for (var dynIndex = videoItems.length - 1; dynIndex >= 0; dynIndex--) {
+    var dynItem = videoItems[dynIndex];
     try {
-      await handleDynamic(item, up, settings, env);
-      result.dynamics.push({ up: up.name || up.mid, id: String(item.id_str || item.id || ''), type: item.type || '动态' });
+      await handleDynamic(dynItem, up, settings, env);
+      result.dynamics.push({ up: up.name || up.mid, id: String(dynItem.id_str || dynItem.id || ''), type: dynItem.type || '动态', bvid: extractDynamicInfo(dynItem).bvid });
     } catch (e) {
-      const msg = '[' + (up.name || up.mid) + '] 动态处理失败：' + String(e.message || e);
+      var msg = '[' + (up.name || up.mid) + '] 动态处理失败：' + String(e.message || e);
       result.errors.push(msg);
       await addLog(env, 'error', msg);
     }
