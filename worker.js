@@ -10,6 +10,11 @@ const DEFAULT_SETTINGS = {
   rsshubBase: 'https://rsshub.liumingye.cn',
   intervalMinutes: 5,
   notifyOnFirstRun: false,
+  parseApiBase: 'https://bili.kedaya.gq/api?url=',
+  parseWebdavUrl: 'https://alistv6.zjftsl.cf/dav/天翼/我的视频/视频/哔哩哔哩',
+  parseWebdavUser: '',
+  parseWebdavPass: '',
+  parseDefaultFolder: '默认',
   ups: []
 };
 
@@ -699,6 +704,54 @@ async function readJson(req) {
   try { return await req.json(); } catch (e) { return null; }
 }
 
+async function webdavFolderExists(base, folder, auth) {
+  try {
+    var url = base + '/' + folder;
+    var r = await fetch(url, { method: 'PROPFIND', headers: { 'Authorization': 'Basic ' + auth, 'Depth': '0', 'User-Agent': UA } });
+    return r.status >= 200 && r.status < 300;
+  } catch (e) { return false; }
+}
+
+async function parseAndUploadVideo(settings, link, env) {
+  var target = String(link || '').trim();
+  if (!target) return { ok: false, error: '链接为空' };
+  if (!settings.parseApiBase) return { ok: false, error: '未配置解析接口前缀' };
+  if (!settings.parseWebdavUrl) return { ok: false, error: '未配置解析下载WebDAV地址' };
+  var parseResp = await fetch(settings.parseApiBase + encodeURIComponent(target), { headers: { 'User-Agent': UA, 'Accept': 'application/json' } });
+  var parseJson = await parseResp.json().catch(function(){ return null; });
+  if (!parseResp.ok || !parseJson || parseJson.code !== 0 || !parseJson.data || !parseJson.data.durl || !parseJson.data.durl.length || !parseJson.data.durl[0].url) {
+    return { ok: false, error: '解析失败：' + String((parseJson && parseJson.message) || ('HTTP ' + parseResp.status)) };
+  }
+  var data = parseJson.data;
+  var bvid = data.bvid || extractBvid(target) || 'unknown';
+  var title = data.title || bvid;
+  var ownerName = data.owner && data.owner.name ? String(data.owner.name) : '';
+  var base = String(settings.parseWebdavUrl).replace(/\/+$/, '');
+  var auth = base64Encode((settings.parseWebdavUser || '') + ':' + (settings.parseWebdavPass || ''));
+  var defaultFolderRaw = settings.parseDefaultFolder ? sanitize(settings.parseDefaultFolder) : '默认';
+  var folderRaw = ownerName ? sanitize(ownerName) : defaultFolderRaw;
+  var folder = encodeURIComponent(folderRaw);
+  if (ownerName && !(await webdavFolderExists(base, folder, auth))) {
+    folderRaw = defaultFolderRaw;
+    folder = encodeURIComponent(defaultFolderRaw);
+  }
+  var filename = encodeURIComponent(sanitize(title) + '_' + bvid + '.mp4');
+  var dest = base + '/' + folder + '/' + filename;
+  var videoResp = await fetch(data.durl[0].url, { headers: { 'User-Agent': UA, 'Referer': 'https://www.bilibili.com/' }, redirect: 'follow' });
+  if (!videoResp.ok) return { ok: false, error: '视频下载失败 HTTP ' + videoResp.status };
+  var uploadResp = await fetch(dest, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' }, body: videoResp.body });
+  if (uploadResp.status < 200 || uploadResp.status >= 300) return { ok: false, error: 'WebDAV上传失败 HTTP ' + uploadResp.status };
+  await addLog(env, 'info', '解析下载成功：' + title + ' -> ' + folderRaw);
+  return { ok: true, title: title, bvid: bvid, folder: folderRaw };
+}
+
+async function parseBatchDownload(env, links) {
+  var settings = await getSettings(env);
+  var results = [];
+  for (var i = 0; i < links.length; i++) results.push(await parseAndUploadVideo(settings, links[i], env));
+  return results;
+}
+
 async function handleApi(request, env) {
   const url = new URL(request.url);
   const path = (url.pathname || '/').replace(/\/+$/, '') || '/';
@@ -889,6 +942,20 @@ if (path === '/api/logs' && method === 'GET') {
     }
   }
 
+  if (path === '/api/parse-batch' && method === 'POST') {
+    const body = await readJson(request);
+    if (!body || !Array.isArray(body.links)) return json({ ok: false, error: '无效JSON或缺少links' }, 400);
+    var links = body.links.map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+    if (!links.length) return json({ ok: false, error: '请输入至少一个视频链接' }, 400);
+    try {
+      var results = await parseBatchDownload(env, links);
+      var okCount = results.filter(function (r) { return r.ok; }).length;
+      return json({ ok: true, results: results, okCount: okCount });
+    } catch (e) {
+      return json({ ok: false, error: String(e && e.message || e) }, 500);
+    }
+  }
+
   return json({ ok: false, error: 'Not found' }, 404);
 }
 
@@ -904,7 +971,7 @@ const UI_HTML = [
 "body{margin:0;font-family:system-ui,Segoe UI,Microsoft YaHei,Arial,sans-serif;background:#f5f6f8;color:#202124}",
 "header{background:#262a33;color:#fff;padding:18px 26px}",
 "h1{margin:0;font-size:22px}",
-".wrap{max-width:1000px;margin:22px auto;padding:0 16px}",
+"<div class=\"wrap page active\" id=\"page-monitor\">",
 ".card{background:#fff;border:1px solid #e2e5eb;border-radius:10px;padding:18px;margin-bottom:16px;box-shadow:0 1px 2px rgba(30,34,40,.04)}",
 ".card h2{margin:0 0 12px;font-size:17px}",
 "label{display:block;font-size:13px;color:#555;margin-bottom:5px}",
@@ -924,12 +991,31 @@ const UI_HTML = [
 ".log{max-height:380px;overflow:auto;background:#171a21;color:#d4d8e0;border-radius:8px;padding:12px;font-size:12px;font-family:Consolas,Menlo,monospace}",
 ".log div{padding:3px 0;border-bottom:1px solid #272b35}",
 ".log .error{color:#ff8080}.log .info{color:#8fb8ff}",
+"<div class=\"wrap page\" id=\"page-parser\">",
+"<div class=\"card\"><h2>视频解析下载</h2>",
+"<label>B站视频链接（每行一个）</label>",
+"<textarea id=\"parseLinks\" placeholder=\"https://www.bilibili.com/video/BV...\"></textarea>",
+"<div class=\"row\"><div><label>解析接口前缀</label><input id=\"parseApiBase\"></div><div><label>默认文件夹</label><input id=\"parseDefaultFolder\" placeholder=\"默认\"></div></div>",
+"<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"parseWebdavUrl\"></div><div></div></div>",
+"<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"parseWebdavUser\"></div><div><label>WebDAV 密码</label><input id=\"parseWebdavPass\" type=\"password\"></div></div>",
+"<p class=\"muted\">下载后优先存入对应UP主名称文件夹；不存在则存入默认文件夹。</p>",
+"<button id=\"saveParseSettingsBtn\" class=\"gray\">保存解析设置</button> <button id=\"parseBtn\">开始解析并下载</button>",
+"<div id=\"parseResult\" class=\"parse-result\"></div>",
+"</div>",
+"</div>",
 ".toast{position:fixed;right:18px;bottom:18px;background:#20242c;color:#fff;padding:10px 14px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none}",
 ".toast.show{opacity:1}",
+".tabs{display:flex;gap:8px;margin-top:12px}",
+".tab{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.25);color:#fff;padding:8px 16px;border-radius:999px;cursor:pointer;font-size:14px}",
+".tab.active{background:#fff;color:#262a33;font-weight:700}",
+".page{display:none}",
+".page.active{display:block}",
+".parse-result{min-height:60px;max-height:340px;overflow:auto;background:#f8f9fb;border:1px solid #e2e5eb;border-radius:8px;padding:10px;font-size:12px;font-family:Consolas,Menlo,monospace;white-space:pre-wrap;margin-top:12px}",
+".muted{color:#7a8494;font-size:12px;margin:6px 0 0}",
 "</style>",
 "</head>",
 "<body>",
-"<header><h1>📡 B站UP主监控</h1></header>",
+"<header><h1>📡 B站UP主监控</h1><nav class=\"tabs\"><button class=\"tab active\" id=\"tab-monitor\" onclick=\"switchPage('monitor')\">监控</button><button class=\"tab\" id=\"tab-parser\" onclick=\"switchPage('parser')\">视频解析下载</button></nav></header>",
 "<div class=\"wrap\">",
 "<div class=\"card\"><h2>全局设置</h2>",
 "<label>B站 Cookie（建议粘贴含 SESSDATA 的完整Cookie）</label>",
@@ -939,7 +1025,11 @@ const UI_HTML = [
 "<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"webdavUrl\" placeholder=\"https://dav.example.com/dav/\"></div><div><label>检查间隔（分钟）</label><input id=\"intervalMinutes\" type=\"number\" min=\"1\"></div></div>",
 "<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"webdavUser\"></div><div><label>WebDAV 密码</label><input id=\"webdavPass\" type=\"password\"></div></div>",
 "<label class=\"check\"><input id=\"notifyOnFirstRun\" type=\"checkbox\"> 首次运行时也推送已存在的视频/动态</label>",
+"function switchPage(name){var tabs=document.querySelectorAll(\".tab\");tabs.forEach(function(t){t.classList.toggle(\"active\",t.id===\"tab-\"+name);});var pages=document.querySelectorAll(\".page\");pages.forEach(function(p){p.classList.toggle(\"active\",p.id===\"page-\"+name);});}",
+"function parseBatch(){var box=$(\"#parseResult\");box.textContent=\"开始解析...\";var links=$(\"#parseLinks\").value.split(/\\r?\\n/).map(function(x){return x.trim();}).filter(Boolean);if(!links.length){box.textContent=\"请至少输入一个视频链接\";return;}var btn=$(\"#parseBtn\");btn.disabled=true;api(\"/api/parse-batch\",{method:\"POST\",body:JSON.stringify({links:links})}).then(function(j){if(!j||!j.ok){box.textContent=j&&j.error||\"请求失败\";return;}var lines=j.results.map(function(r){return (r.ok?\"✅ \":\"❌ \")+r.title+\" | \"+r.bvid+\" | \"+(r.folder||\"\")+(r.ok?\"\":(\" | \"+r.error));});box.textContent=lines.join(\"\\n\");toast(j.okCount+\"/\"+j.results.length+\" 成功\");}).catch(function(){box.textContent=\"请求失败\";toast(\"请求失败\");}).finally(function(){btn.disabled=false;});}",
 "<button id=\"saveBtn\">保存设置</button> <button id=\"testWecomBtn\" class=\"gray\">测试企微</button> <button id=\"testWebdavBtn\" class=\"gray\">测试WebDAV</button>",
+"$(\"#saveParseSettingsBtn\").addEventListener(\"click\",saveSettings);",
+"$(\"#parseBtn\").addEventListener(\"click\",parseBatch);",
 "</div>",
 "<div class=\"card\"><h2>UP主管理</h2>",
 "<div class=\"row\"><div><label>UID 或空间链接</label><input id=\"newMid\" placeholder=\"例如 946974 或 https://space.bilibili.com/946974\"></div><div><label>名称（可选）</label><input id=\"newName\"></div></div>",
@@ -958,8 +1048,8 @@ const UI_HTML = [
 "function $(id){return document.getElementById(id);}",
 "function toast(msg){var el=$(\"toast\");el.textContent=msg;el.className=\"toast show\";setTimeout(function(){el.className=\"toast\";},2200);}",
 "function api(path,opts){opts=opts||{};opts.headers=Object.assign({\"Content-Type\":\"application/json\"},opts.headers||{});return fetch(path,opts).then(function(r){return r.json();});}",
-"function collectSettings(){return {cookie:$(\"cookie\").value,wecomWebhook:$(\"wecomWebhook\").value,downloadApi:$(\"downloadApi\").value,rsshubBase:$(\"rsshubBase\").value,webdavUrl:$(\"webdavUrl\").value,webdavUser:$(\"webdavUser\").value,webdavPass:$(\"webdavPass\").value,intervalMinutes:Number($(\"intervalMinutes\").value)||5,notifyOnFirstRun:!!$(\"notifyOnFirstRun\").checked,ups:state.settings?state.settings.ups:[]};}",
-"function fillSettings(s){state.settings=s;$(\"cookie\").value=s.cookie||\"\";$(\"wecomWebhook\").value=s.wecomWebhook||\"\";$(\"downloadApi\").value=s.downloadApi||\"https://bili.kedaya.gq/api/download?url=\";$(\"rsshubBase\").value=s.rsshubBase||\"https://rsshub.liumingye.cn\";$(\"webdavUrl\").value=s.webdavUrl||\"\";$(\"webdavUser\").value=s.webdavUser||\"\";$(\"webdavPass\").value=s.webdavPass||\"\";$(\"intervalMinutes\").value=s.intervalMinutes||5;$(\"notifyOnFirstRun\").checked=!!s.notifyOnFirstRun;renderUps();}",
+"function collectSettings(){return {cookie:$(\"#cookie\").value,wecomWebhook:$(\"#wecomWebhook\").value,downloadApi:$(\"#downloadApi\").value,rsshubBase:$(\"#rsshubBase\").value,webdavUrl:$(\"#webdavUrl\").value,webdavUser:$(\"#webdavUser\").value,webdavPass:$(\"#webdavPass\").value,intervalMinutes:Number($(\"#intervalMinutes\").value)||5,notifyOnFirstRun:!!$(\"#notifyOnFirstRun\").checked,parseApiBase:$(\"#parseApiBase\").value,parseWebdavUrl:$(\"#parseWebdavUrl\").value,parseWebdavUser:$(\"#parseWebdavUser\").value,parseWebdavPass:$(\"#parseWebdavPass\").value,parseDefaultFolder:$(\"#parseDefaultFolder\").value,ups:state.settings?state.settings.ups:[]};}",
+"function fillSettings(s){state.settings=s;$(\"#cookie\").value=s.cookie||\"\";$(\"#wecomWebhook\").value=s.wecomWebhook||\"\";$(\"#downloadApi\").value=s.downloadApi||\"https://bili.kedaya.gq/api/download?url=\";$(\"#rsshubBase\").value=s.rsshubBase||\"https://rsshub.liumingye.cn\";$(\"#webdavUrl\").value=s.webdavUrl||\"\";$(\"#webdavUser\").value=s.webdavUser||\"\";$(\"#webdavPass\").value=s.webdavPass||\"\";$(\"#intervalMinutes\").value=s.intervalMinutes||5;$(\"#notifyOnFirstRun\").checked=!!s.notifyOnFirstRun;$(\"#parseApiBase\").value=s.parseApiBase||\"https://bili.kedaya.gq/api?url=\";$(\"#parseWebdavUrl\").value=s.parseWebdavUrl||\"\";$(\"#parseWebdavUser\").value=s.parseWebdavUser||\"\";$(\"#parseWebdavPass\").value=s.parseWebdavPass||\"\";$(\"#parseDefaultFolder\").value=s.parseDefaultFolder||\"默认\";renderUps();}",
 "function makeTd(text){var td=document.createElement(\"td\");td.textContent=text;return td;}",
 "function makeCheck(checked,onChange){var td=document.createElement(\"td\");var input=document.createElement(\"input\");input.type=\"checkbox\";input.checked=!!checked;input.addEventListener(\"change\",function(e){onChange(e.target.checked);});td.appendChild(input);return td;}",
 "function updateUpFlag(id,field,val){var patch={};patch[field]=val;api(\"/api/ups/update\",{method:\"POST\",body:JSON.stringify({id:id,patch:patch})}).then(function(j){if(!j||!j.ok){toast(j&&j.error||\"更新失败\");return;}var u=(state.settings.ups||[]).find(function(x){return x.id===id;});if(u){u[field]=val;}renderUps();}).catch(function(){toast(\"更新失败\");});}",
