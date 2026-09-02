@@ -50,7 +50,7 @@ function json(data, status) {
 }
 
 function html(str) {
-  return new Response(str, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return new Response(str, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate' } });
 }
 
 function rotl(x, c) { return ((x << c) | (x >>> (32 - c))) >>> 0; }
