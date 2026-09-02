@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS = {
   parseWebdavUser: '',
   parseWebdavPass: '',
   parseDefaultFolder: '默认',
+  logWebdavUrl: '',
   ups: []
 };
 
@@ -323,7 +324,39 @@ async function saveSettings(env, input) {
   return next;
 }
 
+async function getLogsFromWebdav(settings) {
+  if (!settings || !settings.logWebdavUrl) return [];
+  var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
+  var resp = await fetch(settings.logWebdavUrl, { headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Accept': 'application/json' } });
+  if (resp.status === 404) return [];
+  if (!resp.ok) throw new Error('读取日志失败 HTTP ' + resp.status);
+  var text = await resp.text();
+  if (!text || !text.trim()) return [];
+  try { var j = JSON.parse(text); return Array.isArray(j) ? j : []; } catch (e) { return []; }
+}
+
+async function saveLogsToWebdav(settings, logs) {
+  if (!settings || !settings.logWebdavUrl) return false;
+  var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
+  var resp = await fetch(settings.logWebdavUrl, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/json; charset=utf-8', 'Overwrite': 'T' }, body: JSON.stringify(logs) });
+  if (resp.status === 405) return true;
+  if (!resp.ok) throw new Error('日志写入 WebDAV 失败 HTTP ' + resp.status);
+  return true;
+}
+
 async function addLog(env, level, msg) {
+  var settings = await getSettings(env);
+  if (settings.logWebdavUrl) {
+    try {
+      var wdLogs = await getLogsFromWebdav(settings);
+      wdLogs.unshift({ t: Date.now(), level: level, msg: String(msg) });
+      if (wdLogs.length > 300) wdLogs.length = 300;
+      await saveLogsToWebdav(settings, wdLogs);
+      return;
+    } catch (e) {
+      return;
+    }
+  }
   const logs = await kvGet(env, 'logs', []);
   logs.unshift({ t: Date.now(), level: level, msg: String(msg) });
   if (logs.length > 200) logs.length = 200;
@@ -823,6 +856,15 @@ async function handleApi(request, env) {
   }
 
   if (path === '/api/logs/clear' && method === 'POST') {
+    const settings = await getSettings(env);
+    if (settings.logWebdavUrl) {
+      try {
+        await saveLogsToWebdav(settings, []);
+        return json({ ok: true });
+      } catch (e) {
+        return json({ ok: false, error: String(e && e.message || e) }, 500);
+      }
+    }
     await env.BILI_MONITOR_KV.delete('logs');
     return json({ ok: true });
   }
@@ -899,6 +941,15 @@ if (path === '/api/download-progress' && method === 'GET') {
   }
 
 if (path === '/api/logs' && method === 'GET') {
+    const settings = await getSettings(env);
+    if (settings.logWebdavUrl) {
+      try {
+        const logs = await getLogsFromWebdav(settings);
+        return json({ ok: true, logs: logs });
+      } catch (e) {
+        return json({ ok: false, error: String(e && e.message || e) }, 500);
+      }
+    }
     const logs = await kvGet(env, 'logs', []);
     return json({ ok: true, logs: logs });
   }
@@ -1023,6 +1074,7 @@ const UI_HTML = [
 "<div class=\"row\"><div><label>RSSHub 实例地址</label><textarea id=\"rsshubBase\" placeholder=\"每行一个地址，例如 https://rsshub.liumingye.cn\"></textarea></div><div></div></div>",
 "<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"webdavUrl\" placeholder=\"https://dav.example.com/dav/\"></div><div><label>检查间隔（分钟）</label><input id=\"intervalMinutes\" type=\"number\" min=\"1\"></div></div>",
 "<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"webdavUser\"></div><div><label>WebDAV 密码</label><input id=\"webdavPass\" type=\"password\"></div></div>",
+"<div class=\"row\"><div><label>日志 WebDAV 文件完整地址</label><input id=\"logWebdavUrl\" placeholder=\"https://your-webdav/logs.json\"></div><div></div></div>",
 "<label class=\"check\"><input id=\"notifyOnFirstRun\" type=\"checkbox\"> 首次运行时也推送已存在的视频/动态</label>",
 "<button id=\"saveBtn\">保存设置</button> <button id=\"testWecomBtn\" class=\"gray\">测试企微</button> <button id=\"testWebdavBtn\" class=\"gray\">测试WebDAV</button>",
 "$(\"#saveParseSettingsBtn\").addEventListener(\"click\",saveSettings);",
@@ -1057,8 +1109,8 @@ const UI_HTML = [
 "function $(id){return document.getElementById(id);}",
 "function toast(msg){var el=$(\"toast\");el.textContent=msg;el.className=\"toast show\";setTimeout(function(){el.className=\"toast\";},2200);}",
 "function api(path,opts){opts=opts||{};opts.headers=Object.assign({\"Content-Type\":\"application/json\"},opts.headers||{});return fetch(path,opts).then(function(r){return r.json();});}",
-"function collectSettings(){return {cookie:$(\"#cookie\").value,wecomWebhook:$(\"#wecomWebhook\").value,downloadApi:$(\"#downloadApi\").value,rsshubBase:$(\"#rsshubBase\").value,webdavUrl:$(\"#webdavUrl\").value,webdavUser:$(\"#webdavUser\").value,webdavPass:$(\"#webdavPass\").value,intervalMinutes:Number($(\"#intervalMinutes\").value)||5,notifyOnFirstRun:!!$(\"#notifyOnFirstRun\").checked,parseApiBase:$(\"#parseApiBase\").value,parseWebdavUrl:$(\"#parseWebdavUrl\").value,parseWebdavUser:$(\"#parseWebdavUser\").value,parseWebdavPass:$(\"#parseWebdavPass\").value,parseDefaultFolder:$(\"#parseDefaultFolder\").value,ups:state.settings?state.settings.ups:[]};}",
-"function fillSettings(s){state.settings=s;$(\"#cookie\").value=s.cookie||\"\";$(\"#wecomWebhook\").value=s.wecomWebhook||\"\";$(\"#downloadApi\").value=s.downloadApi||\"https://bili.kedaya.gq/api/download?url=\";$(\"#rsshubBase\").value=s.rsshubBase||\"https://rsshub.liumingye.cn\";$(\"#webdavUrl\").value=s.webdavUrl||\"\";$(\"#webdavUser\").value=s.webdavUser||\"\";$(\"#webdavPass\").value=s.webdavPass||\"\";$(\"#intervalMinutes\").value=s.intervalMinutes||5;$(\"#notifyOnFirstRun\").checked=!!s.notifyOnFirstRun;$(\"#parseApiBase\").value=s.parseApiBase||\"https://bili.kedaya.gq/api?url=\";$(\"#parseWebdavUrl\").value=s.parseWebdavUrl||\"\";$(\"#parseWebdavUser\").value=s.parseWebdavUser||\"\";$(\"#parseWebdavPass\").value=s.parseWebdavPass||\"\";$(\"#parseDefaultFolder\").value=s.parseDefaultFolder||\"默认\";renderUps();}",
+"function collectSettings(){return {cookie:$(\"#cookie\").value,wecomWebhook:$(\"#wecomWebhook\").value,downloadApi:$(\"#downloadApi\").value,rsshubBase:$(\"#rsshubBase\").value,webdavUrl:$(\"#webdavUrl\").value,webdavUser:$(\"#webdavUser\").value,webdavPass:$(\"#webdavPass\").value,logWebdavUrl:$(\"#logWebdavUrl\").value,intervalMinutes:Number($(\"#intervalMinutes\").value)||5,notifyOnFirstRun:!!$(\"#notifyOnFirstRun\").checked,parseApiBase:$(\"#parseApiBase\").value,parseWebdavUrl:$(\"#parseWebdavUrl\").value,parseWebdavUser:$(\"#parseWebdavUser\").value,parseWebdavPass:$(\"#parseWebdavPass\").value,parseDefaultFolder:$(\"#parseDefaultFolder\").value,ups:state.settings?state.settings.ups:[]};}",
+"function fillSettings(s){state.settings=s;$(\"#cookie\").value=s.cookie||\"\";$(\"#wecomWebhook\").value=s.wecomWebhook||\"\";$(\"#downloadApi\").value=s.downloadApi||\"https://bili.kedaya.gq/api/download?url=\";$(\"#rsshubBase\").value=s.rsshubBase||\"https://rsshub.liumingye.cn\";$(\"#webdavUrl\").value=s.webdavUrl||\"\";$(\"#webdavUser\").value=s.webdavUser||\"\";$(\"#webdavPass\").value=s.webdavPass||\"\";$(\"#logWebdavUrl\").value=s.logWebdavUrl||\"\";$(\"#intervalMinutes\").value=s.intervalMinutes||5;$(\"#notifyOnFirstRun\").checked=!!s.notifyOnFirstRun;$(\"#parseApiBase\").value=s.parseApiBase||\"https://bili.kedaya.gq/api?url=\";$(\"#parseWebdavUrl\").value=s.parseWebdavUrl||\"\";$(\"#parseWebdavUser\").value=s.parseWebdavUser||\"\";$(\"#parseWebdavPass\").value=s.parseWebdavPass||\"\";$(\"#parseDefaultFolder\").value=s.parseDefaultFolder||\"默认\";renderUps();}",
 "function makeTd(text){var td=document.createElement(\"td\");td.textContent=text;return td;}",
 "function makeCheck(checked,onChange){var td=document.createElement(\"td\");var input=document.createElement(\"input\");input.type=\"checkbox\";input.checked=!!checked;input.addEventListener(\"change\",function(e){onChange(e.target.checked);});td.appendChild(input);return td;}",
 "function updateUpFlag(id,field,val){var patch={};patch[field]=val;api(\"/api/ups/update\",{method:\"POST\",body:JSON.stringify({id:id,patch:patch})}).then(function(j){if(!j||!j.ok){toast(j&&j.error||\"更新失败\");return;}var u=(state.settings.ups||[]).find(function(x){return x.id===id;});if(u){u[field]=val;}renderUps();}).catch(function(){toast(\"更新失败\");});}",
