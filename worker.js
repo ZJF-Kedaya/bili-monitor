@@ -492,7 +492,6 @@ async function addLog(env, level, msg) {
     try {
       await saveLogsToMysql(settings, [{ t: Date.now(), level: level, msg: String(msg) }]);
     } catch (e) {}
-    return;
   }
   if (settings.logWebdavUrl) {
     try {
@@ -1154,7 +1153,7 @@ if (path === '/api/logs' && method === 'GET') {
       const logs = await getLogsFromMysql(settings);
       return json({ ok: true, logs: logs, source: "mysql" });
     } catch (e) {
-      return json({ ok: false, error: String(e && e.message || e), source: "mysql" }, 500);
+      
     }
   }
   if (settings.logWebdavUrl) {
@@ -1165,7 +1164,8 @@ if (path === '/api/logs' && method === 'GET') {
         return json({ ok: false, error: String(e && e.message || e), source: 'webdav' }, 500);
       }
     }
-    return json({ ok: true, logs: [], source: 'none' });
+    var kvLogs = await kvGet(env, 'logs', []);
+    return json({ ok: true, logs: kvLogs, source: 'kv' });
   }
 
   if (path === '/api/check' && method === 'POST') {
