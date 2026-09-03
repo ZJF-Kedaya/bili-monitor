@@ -500,7 +500,7 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   if (!logUser || !logPass) throw new Error('WebDAV凭据缺失：请填写 WebDAV 用户名和密码');
   var auth = base64Encode(logUser + ':' + logPass);
   await ensureWebdavFolder(base, folder, auth);
-  var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' };
+  var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream' };
   var upload;
   if (manual && typeof download.body.tee === 'function') {
     var branches = download.body.tee();
@@ -793,15 +793,19 @@ async function webdavFolderExists(base, folder, auth) {
 async function webdavFileExists(base, folder, filename, auth) {
   try {
     var url = base + '/' + folder + '/' + filename;
-    var r = await fetch(url, {
-      method: 'PROPFIND',
-      headers: {
-        'Authorization': 'Basic ' + auth,
-        'Depth': '0',
-        'User-Agent': UA
-      }
-    });
-    return r.status >= 200 && r.status < 300;
+    var baseHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA };
+    var methods = [
+      { method: 'PROPFIND', extra: { 'Depth': '0' } },
+      { method: 'HEAD', extra: {} }
+    ];
+    for (var i = 0; i < methods.length; i++) {
+      var h = Object.assign({}, baseHeaders, methods[i].extra);
+      var r = await fetch(url, { method: methods[i].method, headers: h });
+      if (r.status >= 200 && r.status < 300) return true;
+    }
+    var rr = await fetch(url, { method: 'GET', headers: Object.assign({ 'Range': 'bytes=0-0' }, baseHeaders) });
+    if (rr.status === 206 || (rr.status >= 200 && rr.status < 300)) return true;
+    return false;
   } catch (e) { return false; }
 }
 
