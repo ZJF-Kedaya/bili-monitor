@@ -368,8 +368,8 @@ async function addLog(env, level, msg) {
       wdLogs.unshift({ t: Date.now(), level: level, msg: String(msg) });
       if (wdLogs.length > 300) wdLogs.length = 300;
       await saveLogsToWebdav(settings, wdLogs);
-      return;
     } catch (e) {}
+    return;
   }
   kvLogBuffer.unshift({ t: Date.now(), level: level, msg: String(msg) });
   if (kvLogBuffer.length > 200) kvLogBuffer.length = 200;
@@ -975,12 +975,10 @@ if (path === '/api/logs' && method === 'GET') {
         const logs = await getLogsFromWebdav(settings);
         return json({ ok: true, logs: logs, source: 'webdav' });
       } catch (e) {
-        const kvLogs = await kvGet(env, 'logs', []);
-        return json({ ok: true, logs: kvLogs, source: 'kv', warning: String(e && e.message || e) });
+        return json({ ok: false, error: String(e && e.message || e), source: 'webdav' }, 500);
       }
     }
-    const logs = await kvGet(env, 'logs', []);
-    return json({ ok: true, logs: logs, source: 'kv' });
+    return json({ ok: true, logs: [], source: 'none' });
   }
 
   if (path === '/api/check' && method === 'POST') {
