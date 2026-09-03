@@ -327,7 +327,7 @@ async function saveSettings(env, input) {
 async function getLogsFromWebdav(settings) {
   if (!settings || !settings.logWebdavUrl) return [];
   var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
-  var resp = await fetch(settings.logWebdavUrl, { headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Accept': 'application/json' } });
+  var resp = await fetch(settings.logWebdavUrl, { headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA }, redirect: 'follow' });
   if (resp.status === 404) return [];
   if (!resp.ok) throw new Error('读取日志失败 HTTP ' + resp.status);
   var text = await resp.text();
