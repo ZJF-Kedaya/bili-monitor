@@ -329,7 +329,11 @@ async function getLogsFromWebdav(settings) {
   var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
   var resp = await fetch(settings.logWebdavUrl, { headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA }, redirect: 'follow' });
   if (resp.status === 404) return [];
-  if (!resp.ok) throw new Error('读取日志失败 HTTP ' + resp.status);
+  if (!resp.ok) {
+    var detail = '';
+    try { detail = String(await resp.text()).slice(0, 300); } catch (e) {}
+    throw new Error('读取日志失败 HTTP ' + resp.status + (detail ? ' ' + detail : ''));
+  }
   var text = await resp.text();
   if (!text || !text.trim()) return [];
   try { var j = JSON.parse(text); return Array.isArray(j) ? j : []; } catch (e) { return []; }
@@ -338,9 +342,13 @@ async function getLogsFromWebdav(settings) {
 async function saveLogsToWebdav(settings, logs) {
   if (!settings || !settings.logWebdavUrl) return false;
   var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
-  var resp = await fetch(settings.logWebdavUrl, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/json; charset=utf-8', 'Overwrite': 'T' }, body: JSON.stringify(logs) });
-  if (resp.status === 405) return true;
-  if (!resp.ok) throw new Error('日志写入 WebDAV 失败 HTTP ' + resp.status);
+  var resp = await fetch(settings.logWebdavUrl, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(logs) });
+  if (resp.status === 405 || resp.status === 409) return true;
+  if (!resp.ok) {
+    var detail = '';
+    try { detail = String(await resp.text()).slice(0, 300); } catch (e) {}
+    throw new Error('日志写入 WebDAV 失败 HTTP ' + resp.status + (detail ? ' ' + detail : ''));
+  }
   return true;
 }
 
@@ -354,8 +362,8 @@ async function addLog(env, level, msg) {
       wdLogs.unshift({ t: Date.now(), level: level, msg: String(msg) });
       if (wdLogs.length > 300) wdLogs.length = 300;
       await saveLogsToWebdav(settings, wdLogs);
+      return;
     } catch (e) {}
-    return;
   }
   kvLogBuffer.unshift({ t: Date.now(), level: level, msg: String(msg) });
   if (kvLogBuffer.length > 200) kvLogBuffer.length = 200;
@@ -956,13 +964,14 @@ if (path === '/api/logs' && method === 'GET') {
     if (settings.logWebdavUrl) {
       try {
         const logs = await getLogsFromWebdav(settings);
-        return json({ ok: true, logs: logs });
+        return json({ ok: true, logs: logs, source: 'webdav' });
       } catch (e) {
-        return json({ ok: false, error: String(e && e.message || e) }, 500);
+        const kvLogs = await kvGet(env, 'logs', []);
+        return json({ ok: true, logs: kvLogs, source: 'kv', warning: String(e && e.message || e) });
       }
     }
     const logs = await kvGet(env, 'logs', []);
-    return json({ ok: true, logs: logs });
+    return json({ ok: true, logs: logs, source: 'kv' });
   }
 
   if (path === '/api/check' && method === 'POST') {
