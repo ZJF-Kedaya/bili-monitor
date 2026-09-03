@@ -10,3 +10,8 @@ crons = ["* * * * *"]
 [[kv_namespaces]]
 binding = "BILI_MONITOR_KV"
 id = "b1323de1990543029f152c6e82010509"
+[[d1_databases]]
+binding = "BILI_MONITOR_D1"
+database_name = "bili_monitor"
+database_id = "1c640c36-6044-40c1-9629-319a351a558c"
+
