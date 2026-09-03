@@ -326,7 +326,10 @@ async function saveSettings(env, input) {
 
 async function getLogsFromWebdav(settings) {
   if (!settings || !settings.logWebdavUrl) return [];
-  var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
+  var logUser = settings.logWebdavUser || settings.webdavUser || '';
+  var logPass = settings.logWebdavPass || settings.webdavPass || '';
+  if (!logUser || !logPass) throw new Error('WebDAV凭据缺失：请填写 WebDAV 用户名和密码');
+  var auth = base64Encode(logUser + ':' + logPass);
   var resp = await fetch(settings.logWebdavUrl, { headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA }, redirect: 'follow' });
   if (resp.status === 404) return [];
   if (!resp.ok) {
@@ -341,7 +344,10 @@ async function getLogsFromWebdav(settings) {
 
 async function saveLogsToWebdav(settings, logs) {
   if (!settings || !settings.logWebdavUrl) return false;
-  var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
+  var logUser = settings.logWebdavUser || settings.webdavUser || '';
+  var logPass = settings.logWebdavPass || settings.webdavPass || '';
+  if (!logUser || !logPass) throw new Error('WebDAV凭据缺失：请填写 WebDAV 用户名和密码');
+  var auth = base64Encode(logUser + ':' + logPass);
   var resp = await fetch(settings.logWebdavUrl, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(logs) });
   if (resp.status === 405 || resp.status === 409) return true;
   if (!resp.ok) {
@@ -473,7 +479,10 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var filename = encodeURIComponent(sanitize(title) + '_' + bvid + '.mp4');
   var base = String(settings.webdavUrl).replace(/\/+$/, '');
   var dest = base + '/' + folder + '/' + filename;
-  var auth = base64Encode((settings.webdavUser || '') + ':' + (settings.webdavPass || ''));
+  var logUser = settings.logWebdavUser || settings.webdavUser || '';
+  var logPass = settings.logWebdavPass || settings.webdavPass || '';
+  if (!logUser || !logPass) throw new Error('WebDAV凭据缺失：请填写 WebDAV 用户名和密码');
+  var auth = base64Encode(logUser + ':' + logPass);
   await ensureWebdavFolder(base, folder, auth);
   var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' };
   var upload;
