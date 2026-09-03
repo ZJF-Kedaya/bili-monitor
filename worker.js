@@ -324,26 +324,34 @@ async function saveSettings(env, input) {
   return next;
 }
 
+async function webdavFetchLogged(rawUrl, method, authHeader, body) {
+  var baseHeaders = { 'User-Agent': UA };
+  if (authHeader) baseHeaders['Authorization'] = authHeader;
+  if (body !== undefined) { baseHeaders['Content-Type'] = 'application/json; charset=utf-8'; }
+  var resp = await fetch(rawUrl, { method: method, headers: baseHeaders, body: body, redirect: 'manual' });
+  if (resp.status >= 300 && resp.status < 400) {
+    var location = resp.headers.get('location');
+    if (location) {
+      var followHeaders = { 'User-Agent': UA };
+      if (body !== undefined) { followHeaders['Content-Type'] = 'application/json; charset=utf-8'; }
+      resp = await fetch(new URL(location, rawUrl).toString(), { method: method, headers: followHeaders, body: body, redirect: 'follow' });
+    }
+  }
+  return resp;
+}
+
 async function getLogsFromWebdav(settings) {
   if (!settings || !settings.logWebdavUrl) return [];
   var logUser = settings.logWebdavUser || settings.webdavUser || '';
   var logPass = settings.logWebdavPass || settings.webdavPass || '';
   var authHeader = (logUser && logPass) ? ('Basic ' + base64Encode(logUser + ':' + logPass)) : '';
   var logUrl = encodeURI(settings.logWebdavUrl);
-  var resp = await fetch(logUrl, { headers: authHeader ? { 'Authorization': authHeader, 'User-Agent': UA } : { 'User-Agent': UA }, redirect: 'follow' });
+  var resp = await webdavFetchLogged(logUrl, 'GET', authHeader);
   if (resp.status === 404) return [];
   if (!resp.ok) {
     var errText = '';
     try { errText = String(await resp.text()).slice(0, 400); } catch (e) {}
-    if (!authHeader || errText.indexOf('InvalidAuthType') >= 0) {
-      resp = await fetch(logUrl, { headers: { 'User-Agent': UA }, redirect: 'follow' });
-      if (resp.status === 404) return [];
-    }
-    if (!resp.ok) {
-      var errText2 = '';
-      try { errText2 = String(await resp.text()).slice(0, 400); } catch (e) {}
-      throw new Error('读取日志失败 HTTP ' + resp.status + (errText2 || errText));
-    }
+    throw new Error('读取日志失败 HTTP ' + resp.status + errText);
   }
   var text = await resp.text();
   if (!text || !text.trim()) return [];
@@ -355,24 +363,13 @@ async function saveLogsToWebdav(settings, logs) {
   var logUser = settings.logWebdavUser || settings.webdavUser || '';
   var logPass = settings.logWebdavPass || settings.webdavPass || '';
   var authHeader = (logUser && logPass) ? ('Basic ' + base64Encode(logUser + ':' + logPass)) : '';
-  var headers = { 'User-Agent': UA, 'Content-Type': 'application/json; charset=utf-8' };
-  if (authHeader) headers['Authorization'] = authHeader;
   var logUrl = encodeURI(settings.logWebdavUrl);
-  var resp = await fetch(logUrl, { method: 'PUT', headers: headers, body: JSON.stringify(logs) });
+  var resp = await webdavFetchLogged(logUrl, 'PUT', authHeader, JSON.stringify(logs));
   if (resp.status === 405 || resp.status === 409) return true;
   if (!resp.ok) {
     var errText = '';
     try { errText = String(await resp.text()).slice(0, 400); } catch (e) {}
-    if (!authHeader || errText.indexOf('InvalidAuthType') >= 0) {
-      var headers2 = { 'User-Agent': UA, 'Content-Type': 'application/json; charset=utf-8' };
-      resp = await fetch(logUrl, { method: 'PUT', headers: headers2, body: JSON.stringify(logs) });
-      if (resp.status === 405 || resp.status === 409) return true;
-    }
-    if (!resp.ok) {
-      var errText2 = '';
-      try { errText2 = String(await resp.text()).slice(0, 400); } catch (e) {}
-      throw new Error('日志写入 WebDAV 失败 HTTP ' + resp.status + (errText2 || errText));
-    }
+    throw new Error('日志写入 WebDAV 失败 HTTP ' + resp.status + errText);
   }
   return true;
 }
@@ -792,6 +789,22 @@ async function webdavFolderExists(base, folder, auth) {
   } catch (e) { return false; }
 }
 
+
+async function webdavFileExists(base, folder, filename, auth) {
+  try {
+    var url = base + '/' + folder + '/' + filename;
+    var r = await fetch(url, {
+      method: 'PROPFIND',
+      headers: {
+        'Authorization': 'Basic ' + auth,
+        'Depth': '0',
+        'User-Agent': UA
+      }
+    });
+    return r.status >= 200 && r.status < 300;
+  } catch (e) { return false; }
+}
+
 async function parseAndUploadVideo(settings, link, env) {
   var target = String(link || '').trim();
   if (!target) return { ok: false, error: '链接为空' };
@@ -820,7 +833,11 @@ async function parseAndUploadVideo(settings, link, env) {
   var videoResp = await fetch(data.durl[0].url, { headers: { 'User-Agent': UA, 'Referer': 'https://www.bilibili.com/' }, redirect: 'follow' });
   if (!videoResp.ok) return { ok: false, error: '视频下载失败 HTTP ' + videoResp.status };
   var uploadResp = await fetch(dest, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' }, body: videoResp.body });
-  if (uploadResp.status < 200 || uploadResp.status >= 300) return { ok: false, error: 'WebDAV上传失败 HTTP ' + uploadResp.status };
+  var uploadOk = uploadResp.status >= 200 && uploadResp.status < 300;
+  if (!uploadOk && (uploadResp.status === 405 || uploadResp.status === 409)) {
+    uploadOk = await webdavFileExists(base, folder, filename, auth);
+  }
+  if (!uploadOk) return { ok: false, title: title, bvid: bvid, folder: folderRaw, error: 'WebDAV上传失败 HTTP ' + uploadResp.status };
   await addLog(env, 'info', '解析下载成功：' + title + ' -> ' + folderRaw);
   return { ok: true, title: title, bvid: bvid, folder: folderRaw };
 }
