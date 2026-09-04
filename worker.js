@@ -148,7 +148,7 @@ function parseRssItems(xml){
       if (bodyStart < 0 || bodyEnd < 0) return '';
       return tail.slice(bodyStart + 1, bodyEnd);
     }
-    out.push({ title: readTag('title'), link: readTag('link'), guid: readTag('guid'), description: readTag('description'), pubDate: readTag('pubDate') });
+    out.push({ title: readTag('title'), link: readTag('link'), guid: readTag('guid'), description: readTag('description'), pubDate: readTag('pubDate'), author: readTag('author') });;
   }
   return out;
 }
@@ -219,14 +219,15 @@ async function fetchRssDynamics(mid, rawBases, env){
       var items = [];
       for (var k = 0; k < rssItems.length; k++){
         var link = rssItems[k].link || rssItems[k].guid || '';
-        var idMatch = String(link).match(/([0-9]{6,})/);
-        var id = idMatch ? idMatch[1] : '';
-        var bvid = extractBvid(link);
-        var text = decodeXmlEntities(stripRssHtml(rssItems[k].title || rssItems[k].description || ''));
-        var archive = null;
-        if (bvid) archive = { bvid: bvid, title: decodeXmlEntities(stripRssHtml(rssItems[k].title || '')) };
-        items.push({ id_str: id, id: id, type: '动态', modules: { module_author: { name: '' }, module_dynamic: { desc: { text: text }, major: { archive: archive } } } });
-      }
+var desc = rssItems[k].description || '';
+var idMatch = String(link).match(/([0-9]{6,})/);
+var id = idMatch ? idMatch[1] : '';
+var bvid = extractBvid(desc) || extractBvid(rssItems[k].title || '') || extractBvid(link);
+var text = decodeXmlEntities(stripRssHtml(desc || rssItems[k].title || ''));
+var title = decodeXmlEntities(stripRssHtml(rssItems[k].title || ''));
+var archive = null;
+if (bvid) archive = { bvid: bvid, title: title || bvid };
+items.push({ id_str: id, id: id, type: '动态', modules: { module_author: { name: decodeXmlEntities(rssItems[k].author || '') }, module_dynamic: { desc: { text: text }, major: { archive: archive } } } });      }
       if (!items.length) throw new Error('RSSHub未解析到动态');
       await updatePreferredRsshub(env, root);
       return { base: root, data: { code: 0, message: '0', data: { items: items } } };
@@ -285,18 +286,20 @@ async function fetchVideos(mid, cookie, rsshubBase, env) {
 }
 
 async function fetchDynamics(mid, cookie, rsshubBase, env) {
+  try {
+    var rssRes = await fetchRssDynamics(mid, rsshubBase, env);
+    if (rssRes && rssRes.data && rssRes.data.data && rssRes.data.data.items) return rssRes.data;
+  } catch (e) {}
   const cookie2 = await getFingerCookie(cookie);
   try {
     const url = 'https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=' + encodeURIComponent(String(mid)) + '&timezone_offset=-480&features=itemOpusStyle';
     const resp = await fetch(url, { headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/dynamic') });
     const data = await resp.json();
-    if (data && data.code === 0 && data.data && data.data.items) return data;
+    if (data && data.code === 0 && data.data && data.data.items && data.data.items.length) return data;
   } catch (e) {}
-  var rssRes = await fetchRssDynamics(mid, rsshubBase, env);
-  return rssRes.data;
-}
-
-async function kvGet(env, key, def) {
+  var fallbackRss = await fetchRssDynamics(mid, rsshubBase, env);
+  return fallbackRss.data;
+}async function kvGet(env, key, def) {
   try {
     const raw = await env.BILI_MONITOR_KV.get(key);
     return raw ? JSON.parse(raw) : def;
