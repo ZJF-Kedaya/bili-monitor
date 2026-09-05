@@ -1010,7 +1010,7 @@ async function parseAndUploadVideo(settings, link, env) {
       fallbackToDefault = true;
     }
   }
-  var filename = encodeURIComponent(sanitize(title) + '_' + bvid + '.mp4');
+  var filename = encodeURIComponent((fallbackToDefault && ownerName ? sanitize(ownerName) + '_' : '') + sanitize(title) + '_' + bvid + '.mp4');
   var dest = base + '/' + folder + '/' + filename;
   var videoResp = await fetch(data.durl[0].url, { headers: { 'User-Agent': UA, 'Referer': 'https://www.bilibili.com/' }, redirect: 'follow' });
   if (!videoResp.ok) return { ok: false, error: '视频下载失败 HTTP ' + videoResp.status };
