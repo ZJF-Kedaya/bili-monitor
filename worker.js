@@ -511,7 +511,7 @@ async function fetchUpName(mid, cookie, rsshubBase, env) {
       if (!rssResp.ok) continue;
       var xml = await rssResp.text();
       var items = parseRssItems(xml);
-      if (items.length && items[0].author) return String(items[0].author).trim();
+      if (items.length && items[0].author) { var author = String(items[0].author).trim(); var cdata = author.match(/<!\[CDATA\[([\s\S]*?)\]\]>/); if (cdata) author = cdata[1].trim(); author = decodeXmlEntities(stripHtml(author)).replace(/\s+/g, ' ').trim(); if (author) return author; }
     } catch (e) {}
   }
   return String(mid);
