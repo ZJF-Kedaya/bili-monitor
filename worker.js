@@ -178,6 +178,7 @@ async function updatePreferredRsshub(env, base) {
   } catch (e) {}
 }
 
+function cleanRssText(s){var str=String(s||'').trim();var cdata=str.match(/<!\[CDATA\[([\s\S]*?)\]\]>/);if(cdata)str=cdata[1].trim();return decodeXmlEntities(stripRssHtml(str)).replace(/\s+/g,' ').trim();}
 async function fetchRssVideos(mid, rawBases, env){
   var bases = getRsshubBases(rawBases);
   if (!bases.length) throw new Error('未配置RSSHub地址');
@@ -193,7 +194,7 @@ async function fetchRssVideos(mid, rawBases, env){
       var vlist = [];
       for (var k = 0; k < items.length; k++){
         var bvid = extractBvid(items[k].link || items[k].guid);
-        if (bvid) vlist.push({ bvid: bvid, title: decodeXmlEntities(stripRssHtml(items[k].title)) || bvid, created: 0, author: '' });
+        if (bvid) vlist.push({ bvid: bvid, title: cleanRssText(items[k].title) || bvid, created: 0, author: '' });
       }
       if (!vlist.length) throw new Error('RSSHub未解析到视频');
       await updatePreferredRsshub(env, root);
