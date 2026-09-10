@@ -602,7 +602,7 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   if (!download.ok) throw new Error('下载接口 HTTP ' + download.status);
   if (!download.body) throw new Error('下载接口未返回内容');
   var folder = encodeURIComponent(sanitize(up.name || up.mid || String(up.mid)) + '_' + String(up.mid));
-  var filename = encodeURIComponent((fallbackToDefault && ownerName ? sanitize(ownerName) + '_' : '') + sanitize(title) + '_' + bvid + '.mp4');
+  var filename = encodeURIComponent(sanitize(title) + '_' + bvid + '.mp4');
   var base = String(settings.webdavUrl).replace(/\/+$/, '');
   var dest = base + (folder ? '/' + folder : '') + '/' + filename;
   var logUser = settings.logWebdavUser || settings.webdavUser || '';
