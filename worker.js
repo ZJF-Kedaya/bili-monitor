@@ -459,6 +459,32 @@ async function saveDownloadSuccessD1(env, rec) {
   await initDownloadSuccessD1(env);
   await env.BILI_MONITOR_D1.prepare('INSERT INTO bili_monitor_downloads (t, mid, upName, bvid, title, videoUrl, webdavPath) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(Number(rec.t)||Date.now(), String(rec.mid||''), String(rec.upName||''), String(rec.bvid||''), String(rec.title||''), String(rec.videoUrl||''), String(rec.webdavPath||'')).run();
 }
+async function initUpFolderIndexD1(env) {
+  if (!env.BILI_MONITOR_D1) throw new Error('未绑定 BILI_MONITOR_D1');
+  await env.BILI_MONITOR_D1.exec("CREATE TABLE IF NOT EXISTS bili_monitor_up_folders (mid TEXT PRIMARY KEY, upName TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL, updated_at TEXT DEFAULT (datetime('now')))");
+}
+async function getUpFolderIndex(env, mid) {
+  if (!env.BILI_MONITOR_D1 || !mid) return '';
+  try {
+    await initUpFolderIndexD1(env);
+    var r = await env.BILI_MONITOR_D1.prepare('SELECT folder FROM bili_monitor_up_folders WHERE mid = ?').bind(String(mid)).first();
+    return r && r.folder ? String(r.folder) : '';
+  } catch (e) { return ''; }
+}
+async function setUpFolderIndex(env, mid, upName, folder) {
+  if (!env.BILI_MONITOR_D1 || !mid || !folder) return;
+  try {
+    await initUpFolderIndexD1(env);
+    await env.BILI_MONITOR_D1.prepare("INSERT INTO bili_monitor_up_folders (mid, upName, folder) VALUES (?, ?, ?) ON CONFLICT(mid) DO UPDATE SET upName = excluded.upName, folder = excluded.folder, updated_at = datetime('now')").bind(String(mid), String(upName || ''), String(folder)).run();
+  } catch (e) {}
+}
+async function deleteUpFolderIndex(env, mid) {
+  if (!env.BILI_MONITOR_D1 || !mid) return;
+  try {
+    await initUpFolderIndexD1(env);
+    await env.BILI_MONITOR_D1.prepare('DELETE FROM bili_monitor_up_folders WHERE mid = ?').bind(String(mid)).run();
+  } catch (e) {}
+}
 var kvLogBuffer=[];
 var kvLogDirty=false;
 async function addLog(env, level, msg) {
@@ -612,9 +638,16 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var upFolder = encodeURIComponent(upFolderName);
   var folder = '';
   var folderName = '';
-  if (await webdavFolderExists(base, upFolder, auth)) {
+  var folderFromIndex = false;
+  var cachedFolder = await getUpFolderIndex(env, up.mid);
+  if (cachedFolder) {
+    folder = encodeURIComponent(cachedFolder);
+    folderName = cachedFolder;
+    folderFromIndex = true;
+  } else if (await webdavFolderExists(base, upFolder, auth)) {
     folder = upFolder;
     folderName = upFolderName;
+    await setUpFolderIndex(env, up.mid, up.name || up.mid, upFolderName);
   } else {
     var defaultFolderRaw = sanitize(settings.webdavDefaultFolder || '默认');
     var defaultFolder = encodeURIComponent(defaultFolderRaw);
@@ -668,6 +701,10 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
     if (verifyOk) upload = { status: 207 };
   }
   if (upload.status < 200 || upload.status >= 300) {
+    if (folderFromIndex) {
+      await deleteUpFolderIndex(env, up.mid);
+      await addLog(env, 'error', '[' + (up.name || up.mid) + '] 索引中的UP主文件夹已失效，已清除索引，下次将重新探测：' + folderName);
+    }
     if (manual) await writeDlProgress(env, { stage: 'error', message: 'WebDAV 上传失败 HTTP ' + upload.status, percent: 0 });
     throw new Error('WebDAV 上传失败 HTTP ' + upload.status);
   }
