@@ -862,6 +862,12 @@ async function checkDynamics(up, settings, old, next, result, handled, env) {
     return;
   }
   if (firstId === old.dyn) { next.dyn = firstId; return; }
+  const foundOldDyn = items.some(function(item){ return String(item.id_str || item.id || '') === old.dyn; });
+  if (!foundOldDyn) {
+    next.dyn = firstId;
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 上次记录的动态已不在当前列表中（可能被删除或超出RSS返回范围），已重新记录动态基线，不触发通知或下载');
+    return;
+  }
   const fresh = [];
   for (const item of items) {
     if (String(item.id_str || item.id || '') === old.dyn) break;
