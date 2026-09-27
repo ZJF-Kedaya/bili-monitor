@@ -154,6 +154,9 @@ function parseRssItems(xml){
   return out;
 }
 
+var preferredRsshubBase = '';
+var lastPersistedRsshub = '';
+
 function getRsshubBases(raw) {
   var s = String(raw || DEFAULT_SETTINGS.rsshubBase || '');
   var parts = s.split(/[\r\n,]+/);
@@ -163,20 +166,29 @@ function getRsshubBases(raw) {
     while (b.slice(-1) === '/') b = b.slice(0, -1);
     if (b && /^https?:\/\//i.test(b) && out.indexOf(b) < 0) out.push(b);
   }
+  if (preferredRsshubBase) {
+    var preferredIndex = out.indexOf(preferredRsshubBase);
+    if (preferredIndex > 0) {
+      out.splice(preferredIndex, 1);
+      out.unshift(preferredRsshubBase);
+    }
+  }
   return out;
 }
 
 async function updatePreferredRsshub(env, base) {
-  if (!env || !base) return;
-  try {
-    var settings = await getSettings(env);
-    var bases = getRsshubBases(settings.rsshubBase);
-    if (!bases.length || bases[0] === base) return;
-    var next = [base];
-    for (var i = 0; i < bases.length; i++) if (bases[i] !== base) next.push(bases[i]);
-    settings.rsshubBase = next.join('\n');
-    await saveSettings(env, settings);
-  } catch (e) {}
+  if (!base) return;
+  var clean = String(base).replace(/\/+$/, '');
+  if (clean === preferredRsshubBase) return;
+  preferredRsshubBase = clean;
+  // 只把“当前可用实例”记录到 D1（每个 isolate 只在真正变化时写一次），
+  // 不再回写 KV settings，避免每次检查都产生 KV 写入。
+  if (env && env.BILI_MONITOR_D1 && clean !== lastPersistedRsshub) {
+    try {
+      await d1StatePut(env, 'preferredRsshub', clean);
+      lastPersistedRsshub = clean;
+    } catch (e) {}
+  }
 }
 
 function cleanRssText(s){var str=String(s||'').trim();var cdata=str.match(/<!\[CDATA\[([\s\S]*?)\]\]>/);if(cdata)str=cdata[1].trim();return decodeXmlEntities(stripRssHtml(str)).replace(/\s+/g,' ').trim();}
@@ -195,7 +207,14 @@ async function fetchRssVideos(mid, rawBases, env){
       var vlist = [];
       for (var k = 0; k < items.length; k++){
         var bvid = extractBvid(items[k].link || items[k].guid);
-        if (bvid) vlist.push({ bvid: bvid, title: cleanRssText(items[k].title) || bvid, created: 0, author: '' });
+        if (!bvid) continue;
+        var vTitle = cleanRssText(items[k].title);
+        // 部分 RSSHub 实例的 item 标题为空或直接是 BV 号，此时退回描述文本，避免前端只显示 BV 号
+        if (!vTitle || vTitle === bvid) {
+          var vDesc = cleanRssText(items[k].description);
+          if (vDesc) vTitle = vDesc.slice(0, 120);
+        }
+        vlist.push({ bvid: bvid, title: vTitle || bvid, created: 0, author: '' });
       }
       if (!vlist.length) throw new Error('RSSHub未解析到视频');
       await updatePreferredRsshub(env, root);
@@ -222,8 +241,10 @@ async function fetchRssDynamics(mid, rawBases, env){
       for (var k = 0; k < rssItems.length; k++){
         var link = rssItems[k].link || rssItems[k].guid || '';
 var desc = rssItems[k].description || '';
+// 优先取 t.bilibili.com 后面的数字动态ID；取不到时退回 link/guid 原文，
+// 否则 id 为空会让 next.dyn 一直无法落库，每轮都被当成"首次解析"而永远检测不到更新。
 var idMatch = String(link).match(/([0-9]{6,})/);
-var id = idMatch ? idMatch[1] : '';
+var id = idMatch ? idMatch[1] : String(link || rssItems[k].guid || '').trim();
 var bvid = extractBvid(desc) || extractBvid(rssItems[k].title || '') || extractBvid(link);
 var text = decodeXmlEntities(stripRssHtml(desc || rssItems[k].title || ''));
 var title = decodeXmlEntities(stripRssHtml(rssItems[k].title || ''));
@@ -314,18 +335,76 @@ async function kvPut(env, key, val) {
   await env.BILI_MONITOR_KV.put(key, JSON.stringify(val));
 }
 
+var d1StateReady = false;
+async function initD1State(env) {
+  if (!env.BILI_MONITOR_D1) throw new Error('未绑定 BILI_MONITOR_D1');
+  if (d1StateReady) return;
+  await env.BILI_MONITOR_D1.exec("CREATE TABLE IF NOT EXISTS bili_monitor_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT DEFAULT (datetime('now')))");
+  d1StateReady = true;
+}
+
+async function d1StateGet(env, key) {
+  if (!env.BILI_MONITOR_D1) return undefined;
+  try {
+    await initD1State(env);
+    var row = await env.BILI_MONITOR_D1.prepare('SELECT value FROM bili_monitor_state WHERE key = ?').bind(String(key)).first();
+    return row ? String(row.value) : undefined;
+  } catch (e) {
+    return undefined;
+  }
+}
+
+async function d1StatePut(env, key, val) {
+  if (!env.BILI_MONITOR_D1) return false;
+  try {
+    await initD1State(env);
+    await env.BILI_MONITOR_D1.prepare("INSERT INTO bili_monitor_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')").bind(String(key), JSON.stringify(val)).run();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function stateGet(env, key, def) {
+  if (env.BILI_MONITOR_D1) {
+    var raw = await d1StateGet(env, key);
+    if (raw !== undefined) {
+      try { return JSON.parse(raw); } catch (e) { return raw; }
+    }
+    return def;
+  }
+  return kvGet(env, key, def);
+}
+
+async function statePut(env, key, val) {
+  // 绑定了 D1 时只写 D1：绝不能回退到 KV，否则 KV 免费额度会被高频状态写爆。
+  if (env.BILI_MONITOR_D1) {
+    var ok = await d1StatePut(env, key, val);
+    if (!ok) throw new Error('D1 状态写入失败：' + key);
+    return;
+  }
+  await kvPut(env, key, val);
+}
+
 async function getSettings(env) {
   const s = await kvGet(env, 'settings', DEFAULT_SETTINGS);
   const merged = Object.assign({}, DEFAULT_SETTINGS, s);
-  if (!Array.isArray(merged.ups)) merged.ups = [];
+  // 复制一份数组，避免直接改到 DEFAULT_SETTINGS.ups 这个模块级共享对象
+  merged.ups = Array.isArray(merged.ups) ? merged.ups.slice() : [];
   merged.intervalMinutes = Number(merged.intervalMinutes) || 5;
   return merged;
 }
 
 async function saveSettings(env, input) {
   const next = Object.assign({}, DEFAULT_SETTINGS, input);
-  if (!Array.isArray(next.ups)) next.ups = [];
+  const prev = await getSettings(env);
+  if (!Array.isArray(next.ups)) {
+    // 前端没有传 ups（例如设置还没加载完就点了保存）时，保留原有 UP 主列表，避免被清空
+    next.ups = Array.isArray(prev.ups) ? prev.ups : [];
+  }
   next.intervalMinutes = Number(next.intervalMinutes) || 5;
+  // 内容完全一致时不写 KV：避免重复点击“保存”白白消耗 KV 写入额度。
+  if (JSON.stringify(next) === JSON.stringify(prev)) return prev;
   await kvPut(env, 'settings', next);
   return next;
 }
@@ -419,36 +498,58 @@ async function appendSuccessLogToWebdav(settings, entry) {
   return true;
 }
 
+var d1LogsReady = false;
 async function initD1Logs(env) {
   if (!env.BILI_MONITOR_D1) throw new Error('未绑定 BILI_MONITOR_D1');
+  if (d1LogsReady) return;
   await env.BILI_MONITOR_D1.exec('CREATE TABLE IF NOT EXISTS bili_monitor_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER NOT NULL, level TEXT NOT NULL, msg TEXT NOT NULL, created_at TEXT DEFAULT (datetime(\'now\')))');
+  d1LogsReady = true;
 }
 function logDate(t) { return new Date(Number(t) + 8 * 3600000).toISOString().slice(0, 10); }
 function getLogDates(logs) { var seen = {}; var out = []; (logs||[]).forEach(function(x){ var d=logDate(x.t); if(d&&!seen[d]){ seen[d]=1; out.push(d); } }); return out.sort().reverse(); }
+async function getLogDatesD1(env, cutoff) {
+  var r = await env.BILI_MONITOR_D1.prepare("SELECT DISTINCT strftime('%Y-%m-%d', (t / 1000) + 28800, 'unixepoch') AS d FROM bili_monitor_logs WHERE t >= ? ORDER BY d DESC").bind(cutoff).all();
+  return (r.results || []).map(function (x) { return String(x.d || ''); }).filter(Boolean);
+}
 async function getLogsFromD1(env, date) {
   await initD1Logs(env);
   var cutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
-  var r = await env.BILI_MONITOR_D1.prepare('SELECT t, level, msg FROM bili_monitor_logs WHERE t >= ? ORDER BY id DESC LIMIT 300').bind(cutoff).all();
+  var dates = await getLogDatesD1(env, cutoff);
+  var day = String(date || '').trim() || dates[0] || '';
+  if (!day) return { logs: [], dates: dates };
+  var start = Date.parse(day + 'T00:00:00+08:00');
+  if (!isFinite(start)) start = cutoff;
+  var end = start + 24 * 60 * 60 * 1000;
+  var r = await env.BILI_MONITOR_D1.prepare('SELECT t, level, msg FROM bili_monitor_logs WHERE t >= ? AND t < ? ORDER BY id DESC LIMIT 300').bind(start, end).all();
   var logs = (r.results || []).map(function(x){ return { t: Number(x.t), level: x.level || 'info', msg: String(x.msg || '') }; });
-  var dates = getLogDates(logs);
-  if (date) logs = logs.filter(function(x){ return logDate(x.t) === date; });
   return { logs: logs, dates: dates };
-}async function saveLogsToD1(env, logs) {
+}
+async function saveLogsToD1(env, logs) {
   await initD1Logs(env);
   var db = env.BILI_MONITOR_D1;
   for (var i=0;i<logs.length;i++) {
     var it = logs[i];
     await db.prepare('INSERT INTO bili_monitor_logs (t, level, msg) VALUES (?, ?, ?)').bind(Number(it.t)||Date.now(), String(it.level||'info'), String(it.msg||'')).run();
   }
-  await db.prepare('DELETE FROM bili_monitor_logs WHERE t < ?').bind(Date.now() - 3 * 24 * 60 * 60 * 1000).run();
+}
+// 只保留最近三天日志；由定时检查统一调用，避免每条日志都触发一次清理
+async function pruneLogsD1(env) {
+  if (!env.BILI_MONITOR_D1) return;
+  try {
+    await initD1Logs(env);
+    await env.BILI_MONITOR_D1.prepare('DELETE FROM bili_monitor_logs WHERE t < ?').bind(Date.now() - 3 * 24 * 60 * 60 * 1000).run();
+  } catch (e) {}
 }
 async function clearLogsFromD1(env) {
   await initD1Logs(env);
   await env.BILI_MONITOR_D1.exec('DELETE FROM bili_monitor_logs');
 }
+var d1DownloadsReady = false;
 async function initDownloadSuccessD1(env) {
   if (!env.BILI_MONITOR_D1) throw new Error("未绑定 BILI_MONITOR_D1");
+  if (d1DownloadsReady) return;
   await env.BILI_MONITOR_D1.exec("CREATE TABLE IF NOT EXISTS bili_monitor_downloads (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER NOT NULL, mid TEXT NOT NULL, upName TEXT NOT NULL, bvid TEXT NOT NULL, title TEXT NOT NULL, videoUrl TEXT NOT NULL, webdavPath TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))");
+  d1DownloadsReady = true;
 }
 async function getDownloadSuccessD1(env) {
   await initDownloadSuccessD1(env);
@@ -459,9 +560,12 @@ async function saveDownloadSuccessD1(env, rec) {
   await initDownloadSuccessD1(env);
   await env.BILI_MONITOR_D1.prepare('INSERT INTO bili_monitor_downloads (t, mid, upName, bvid, title, videoUrl, webdavPath) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(Number(rec.t)||Date.now(), String(rec.mid||''), String(rec.upName||''), String(rec.bvid||''), String(rec.title||''), String(rec.videoUrl||''), String(rec.webdavPath||'')).run();
 }
+var d1UpFoldersReady = false;
 async function initUpFolderIndexD1(env) {
   if (!env.BILI_MONITOR_D1) throw new Error('未绑定 BILI_MONITOR_D1');
+  if (d1UpFoldersReady) return;
   await env.BILI_MONITOR_D1.exec("CREATE TABLE IF NOT EXISTS bili_monitor_up_folders (mid TEXT PRIMARY KEY, upName TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL, updated_at TEXT DEFAULT (datetime('now')))");
+  d1UpFoldersReady = true;
 }
 async function getUpFolderIndex(env, mid) {
   if (!env.BILI_MONITOR_D1 || !mid) return '';
@@ -488,13 +592,13 @@ async function deleteUpFolderIndex(env, mid) {
 var kvLogBuffer=[];
 var kvLogDirty=false;
 async function addLog(env, level, msg) {
-  var settings = await getSettings(env);
   if (env.BILI_MONITOR_D1) {
     try {
       await saveLogsToD1(env, [{ t: Date.now(), level: level, msg: String(msg) }]);
     } catch (e) {}
     return;
   }
+  var settings = await getSettings(env);
   if (settings.logWebdavUrl) {
     try {
       var wdLogs = await getLogsFromWebdav(settings);
@@ -600,26 +704,18 @@ var dlProgressKey = 'dlProgress';
 
 async function writeDlProgress(env, p) {
   try {
-    await env.BILI_MONITOR_KV.put(dlProgressKey, JSON.stringify(p));
+    await statePut(env, dlProgressKey, p);
   } catch (e) {}
 }
 
 async function readDlProgress(env) {
   try {
-    var raw = await env.BILI_MONITOR_KV.get(dlProgressKey);
-    return raw ? JSON.parse(raw) : null;
+    return await stateGet(env, dlProgressKey, null);
   } catch (e) {
     return null;
   }
 }
 
-async function ensureWebdavFolder(base, folder, auth) {
-  try {
-    var url = base + '/' + folder;
-    var r = await fetch(url, { method: 'MKCOL', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA } });
-    if (r.status === 405 || r.status === 409 || r.status === 201 || r.status === 204) return;
-  } catch (e) {}
-}
 async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   if (!settings.webdavUrl) throw new Error('未配置 WebDAV 地址');
   var videoUrl = 'https://www.bilibili.com/video/' + bvid;
@@ -628,7 +724,6 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA } });
   if (!download.ok) throw new Error('下载接口 HTTP ' + download.status);
   if (!download.body) throw new Error('下载接口未返回内容');
-  var filename = encodeURIComponent(sanitize(title) + '_' + bvid + '.mp4');
   var base = String(settings.webdavUrl).replace(/\/+$/, '');
   var logUser = settings.logWebdavUser || settings.webdavUser || '';
   var logPass = settings.logWebdavPass || settings.webdavPass || '';
@@ -639,6 +734,8 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var folder = '';
   var folderName = '';
   var folderFromIndex = false;
+  // 只有确实存在同名 UP 主文件夹时才放进去；不存在则直接放进默认文件夹，不再新建子目录
+  var usedDefaultFolder = false;
   var cachedFolder = await getUpFolderIndex(env, up.mid);
   if (cachedFolder) {
     folder = encodeURIComponent(cachedFolder);
@@ -650,12 +747,13 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
     await setUpFolderIndex(env, up.mid, up.name || up.mid, upFolderName);
   } else {
     var defaultFolderRaw = sanitize(settings.webdavDefaultFolder || '默认');
-    var defaultFolder = encodeURIComponent(defaultFolderRaw);
-    await ensureWebdavFolder(base, defaultFolder, auth);
-    await ensureWebdavFolder(base, defaultFolder + '/' + upFolder, auth);
-    folder = defaultFolder + '/' + upFolder;
-    folderName = defaultFolderRaw + '/' + upFolderName;
+    folder = encodeURIComponent(defaultFolderRaw);
+    folderName = defaultFolderRaw;
+    usedDefaultFolder = true;
   }
+  // 落入默认文件夹时，文件名前拼接UP主名称用于区分
+  var fileBaseName = (usedDefaultFolder && upFolderName ? upFolderName + '_' : '') + sanitize(title) + '_' + bvid + '.mp4';
+  var filename = encodeURIComponent(fileBaseName);
   var dest = base + '/' + folder + '/' + filename;
   var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream' };
   var upload;
@@ -709,7 +807,7 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
     throw new Error('WebDAV 上传失败 HTTP ' + upload.status);
   }
   if (manual) await writeDlProgress(env, { stage: 'done', message: '上传完成', percent: 100 });
-  await addLog(env, 'info', '[' + (up.name || up.mid) + '] 已上传：' + folderName + '/' + sanitize(title) + '_' + bvid + '.mp4');
+  await addLog(env, 'info', '[' + (up.name || up.mid) + '] 已上传：' + folderName + '/' + fileBaseName);
     if (!manual) {
     try {
       await appendSuccessLogToWebdav(settings, {
@@ -757,41 +855,108 @@ function extractDynamicInfo(item) {
   };
 }
 
-async function handleVideo(item, up, settings, env, handled) {
-  const bvid = item.bvid;
-  if (!bvid) return;
-  if (handled && handled[bvid]) {
-    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 同一BV已处理，跳过重复视频：' + bvid);
-    return;
+function handledKey(up, bvid) {
+  return String(up && up.mid || '') + ':' + String(bvid || '');
+}
+
+// 同一次检查中按 (UP主, BV号) 记录每个动作是否已执行，避免视频与动态重复通知/下载；
+// 已完成的通知不会因后续下载失败而在下一轮重复发送，未完成的下载仍会在下一轮重试。
+function handledEntry(handled, up, bvid) {
+  if (!handled) return null;
+  var key = handledKey(up, bvid);
+  if (!handled[key]) handled[key] = { notifyDone: false, notifyTried: false, downloadDone: false, downloadTried: false };
+  return handled[key];
+}
+
+// 跨轮次的持久去重记录：lastSeen[mid].handled[bvid] = { n: 通知已成功, d: 下载已成功 }
+// 这样即使投稿视频与动态视频不在同一轮检查里出现，也只会通知/下载一次。
+function isHandled(store, bvid, field) {
+  if (!store || !bvid) return false;
+  var rec = store[String(bvid)];
+  return !!(rec && typeof rec === 'object' && rec[field]);
+}
+function markHandled(store, bvid, field) {
+  if (!store || !bvid) return;
+  var key = String(bvid);
+  if (!store[key] || typeof store[key] !== 'object') store[key] = {};
+  store[key][field] = 1;
+}
+// 只保留最近若干个BV，避免 lastSeen 无限膨胀
+function capHandled(store, max) {
+  if (!store || typeof store !== 'object') return;
+  var keys = Object.keys(store);
+  var limit = max || 40;
+  while (keys.length > limit) delete store[keys.shift()];
+}
+
+async function performOnce(entry, doneKey, triedKey, fn) {
+  if (entry) {
+    if (entry[doneKey] || entry[triedKey]) return false;
+    entry[triedKey] = true;
   }
-  if (handled) handled[bvid] = true;
+  await fn();
+  if (entry) entry[doneKey] = true;
+  return true;
+}
+
+async function handleVideo(item, up, settings, env, handled, persist) {
+  const bvid = String(item.bvid || '');
+  if (!bvid) return false;
+  const entry = handledEntry(handled, up, bvid);
+  const needNotify = up.notify !== false && !!settings.wecomWebhook;
+  const needDownload = up.download !== false;
+  const notifyDone = !!(entry && entry.notifyDone) || isHandled(persist, bvid, 'n');
+  const downloadDone = !!(entry && entry.downloadDone) || isHandled(persist, bvid, 'd');
+  if ((notifyDone || downloadDone) && (!needNotify || notifyDone) && (!needDownload || downloadDone)) {
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 同一BV已处理，跳过重复通知和下载：' + bvid);
+    return false;
+  }
   const title = item.title || '无标题';
   const author = item.author || up.name || up.mid;
   const url = 'https://www.bilibili.com/video/' + bvid;
-  if (up.notify !== false && settings.wecomWebhook) {
-    await sendWeCom(settings.wecomWebhook, '新视频', author, title, url, env);
+  if (needNotify && !notifyDone) {
+    var didNotify = await performOnce(entry, 'notifyDone', 'notifyTried', function () {
+      return sendWeCom(settings.wecomWebhook, '新视频', author, title, url, env);
+    });
+    if (didNotify) markHandled(persist, bvid, 'n');
   }
-  if (up.download !== false) {
-    await downloadAndUploadVideo(settings, up, bvid, title, env);
+  if (needDownload && !downloadDone) {
+    var didDownload = await performOnce(entry, 'downloadDone', 'downloadTried', function () {
+      return downloadAndUploadVideo(settings, up, bvid, title, env);
+    });
+    if (didDownload) markHandled(persist, bvid, 'd');
   }
+  return true;
 }
 
-async function handleDynamic(item, up, settings, env, handled) {
+async function handleDynamic(item, up, settings, env, handled, persist) {
   const info = extractDynamicInfo(item);
-  if (!info.bvid) return;
-  if (handled && handled[info.bvid]) {
-    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 动态与已处理视频为同一BV，跳过重复处理：' + info.bvid);
-    return;
+  if (!info.bvid) return false;
+  const bvid = String(info.bvid);
+  const entry = handledEntry(handled, up, bvid);
+  const needNotify = up.notify !== false && !!settings.wecomWebhook;
+  const needDownload = up.download !== false;
+  const notifyDone = !!(entry && entry.notifyDone) || isHandled(persist, bvid, 'n');
+  const downloadDone = !!(entry && entry.downloadDone) || isHandled(persist, bvid, 'd');
+  if ((notifyDone || downloadDone) && (!needNotify || notifyDone) && (!needDownload || downloadDone)) {
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 动态与已处理视频为同一BV，跳过重复通知和下载：' + bvid);
+    return false;
   }
-  if (handled) handled[info.bvid] = true;
-  const url = info.id ? 'https://t.bilibili.com/' + info.id : 'https://space.bilibili.com/' + String(up.mid) + '/dynamic';
+  const url = /^\d+$/.test(info.id) ? 'https://t.bilibili.com/' + info.id : 'https://space.bilibili.com/' + String(up.mid) + '/dynamic';
   const text = info.text || info.type || '（无文字）';
-  if (up.notify !== false && settings.wecomWebhook) {
-    await sendWeCom(settings.wecomWebhook, '新动态', info.author || up.name || up.mid, text, url, env);
+  if (needNotify && !notifyDone) {
+    var didNotify = await performOnce(entry, 'notifyDone', 'notifyTried', function () {
+      return sendWeCom(settings.wecomWebhook, '新动态', info.author || up.name || up.mid, text, url, env);
+    });
+    if (didNotify) markHandled(persist, bvid, 'n');
   }
-  if (info.bvid && up.download !== false) {
-    await downloadAndUploadVideo(settings, up, info.bvid, info.title || info.text || info.id, env);
+  if (needDownload && !downloadDone) {
+    var didDownload = await performOnce(entry, 'downloadDone', 'downloadTried', function () {
+      return downloadAndUploadVideo(settings, up, bvid, info.title || info.text || info.id, env);
+    });
+    if (didDownload) markHandled(persist, bvid, 'd');
   }
+  return true;
 }
 
 async function checkVideos(up, settings, old, next, result, handled, env) {
@@ -800,40 +965,81 @@ async function checkVideos(up, settings, old, next, result, handled, env) {
   const list = (data.data.list && data.data.list.vlist) || [];
   const first = list[0];
   if (!first) return;
+  const currentBvids = list.map(function(item) { return String(item.bvid || ''); }).filter(Boolean);
+  var history = Array.isArray(old.videoHistory) ? old.videoHistory.slice() : [];
+  function rememberHistory() {
+    var seen = {};
+    var merged = [];
+    function add(bvid) {
+      bvid = String(bvid || '');
+      if (bvid && !seen[bvid]) {
+        seen[bvid] = true;
+        merged.push(bvid);
+      }
+    }
+    currentBvids.forEach(add);
+    history.forEach(add);
+    next.videoHistory = merged.slice(0, 30);
+  }
   if (!old.video) {
     next.video = first.bvid;
     next.videoTitle = first.title || '';
+    rememberHistory();
+    if (settings.notifyOnFirstRun && up.notify !== false && settings.wecomWebhook) {
+      try {
+        await sendWeCom(settings.wecomWebhook, '首次解析视频', up.name || up.mid, first.title || first.bvid, 'https://www.bilibili.com/video/' + first.bvid, env);
+        markHandled(next.handled, first.bvid, 'n');
+      } catch (e) {
+        await addLog(env, 'error', '[' + (up.name || up.mid) + '] 首次解析视频通知失败：' + String(e.message || e));
+      }
+    }
     await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次成功解析，已记录视频基线，不下载：' + (first.title || first.bvid));
     return;
   }
-  const foundOld = list.some(function(item){ return item.bvid === old.video; });
-  if (!foundOld) {
-    next.video = first.bvid;
-    next.videoTitle = first.title || '';
-    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 最新视频可能已下架或列表变化，已重新记录基线，不触发通知或下载');
-    return;
-  }
-  const fresh = [];
-  for (const item of list) {
-    if (item.bvid === old.video) break;
-    fresh.push(item);
+  const foundOld = currentBvids.indexOf(String(old.video)) >= 0;
+  var fresh = [];
+  if (foundOld) {
+    for (const item of list) {
+      if (String(item.bvid) === String(old.video)) break;
+      fresh.push(item);
+    }
+  } else {
+    var firstKnown = history.indexOf(String(first.bvid)) >= 0;
+    if (!history.length || firstKnown) {
+      next.video = first.bvid;
+      next.videoTitle = first.title || '';
+      rememberHistory();
+      await addLog(env, 'info', '[' + (up.name || up.mid) + '] 最新视频可能已下架或列表变化，已重新记录基线，不触发通知或下载');
+      return;
+    }
+    fresh.push(first);
   }
   if (!fresh.length) {
     next.video = first.bvid;
     next.videoTitle = first.title || '';
+    rememberHistory();
     return;
   }
   const latest = fresh[0];
+  var processed = false;
   try {
-    await handleVideo(latest, up, settings, env, handled);
-    result.videos.push({ up: up.name || up.mid, bvid: latest.bvid, title: latest.title || '' });
+    var didHandleVideo = await handleVideo(latest, up, settings, env, handled, next.handled);
+    processed = true;
+    if (didHandleVideo) result.videos.push({ up: up.name || up.mid, bvid: latest.bvid, title: latest.title || '' });
   } catch (e) {
     const msg = '[' + (up.name || up.mid) + '] 视频处理失败：' + String(e.message || e);
     result.errors.push(msg);
     await addLog(env, 'error', msg);
   }
-  next.video = first.bvid;
-  next.videoTitle = first.title || '';
+  if (processed) {
+    next.video = first.bvid;
+    next.videoTitle = first.title || '';
+    rememberHistory();
+  } else {
+    next.video = old.video || '';
+    next.videoTitle = old.videoTitle || '';
+    next.videoHistory = history;
+  }
 }
 async function checkDynamics(up, settings, old, next, result, handled, env) {
   const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env);
@@ -848,6 +1054,9 @@ async function checkDynamics(up, settings, old, next, result, handled, env) {
     var latestInfo = extractDynamicInfo(latestVideoItem);
     next.dynVideo = latestInfo.bvid;
     next.dynVideoTitle = latestInfo.title || latestInfo.text || latestInfo.bvid;
+  } else {
+    next.dynVideo = '';
+    next.dynVideoTitle = '';
   }
   const first = items[0];
   if (!first) { next.dyn = old.dyn || ''; return; }
@@ -855,6 +1064,16 @@ async function checkDynamics(up, settings, old, next, result, handled, env) {
   if (!old.dyn) {
     next.dyn = firstId;
     if (latestVideoItem) {
+      var firstInfo = extractDynamicInfo(latestVideoItem);
+      if (settings.notifyOnFirstRun && up.notify !== false && settings.wecomWebhook && !isHandled(next.handled, firstInfo.bvid, 'n')) {
+        try {
+          var firstUrl = /^\d+$/.test(firstInfo.id) ? 'https://t.bilibili.com/' + firstInfo.id : 'https://space.bilibili.com/' + String(up.mid) + '/dynamic';
+          await sendWeCom(settings.wecomWebhook, '首次解析动态', firstInfo.author || up.name || up.mid, firstInfo.title || firstInfo.text || firstInfo.bvid, firstUrl, env);
+          markHandled(next.handled, firstInfo.bvid, 'n');
+        } catch (e) {
+          await addLog(env, 'error', '[' + (up.name || up.mid) + '] 首次解析动态通知失败：' + String(e.message || e));
+        }
+      }
       await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次成功解析动态，已记录动态视频基线：' + next.dynVideoTitle);
     } else {
       await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次成功解析动态，已记录动态基线');
@@ -873,24 +1092,25 @@ async function checkDynamics(up, settings, old, next, result, handled, env) {
     if (String(item.id_str || item.id || '') === old.dyn) break;
     fresh.push(item);
   }
-  var videoItems = fresh.filter(function(item) { var info = extractDynamicInfo(item); return !!info.bvid; });
+  var currentVideoBvid = String(next.video || old.video || '');
+  var videoItems = fresh.filter(function(item) {
+    var info = extractDynamicInfo(item);
+    return !!info.bvid && String(info.bvid) !== currentVideoBvid;
+  });
   if (!videoItems.length) { next.dyn = firstId; return; }
   var newestVideo = videoItems[0];
-  for (var dynIndex = videoItems.length - 1; dynIndex >= 0; dynIndex--) {
-    var dynItem = videoItems[dynIndex];
-    try {
-      await handleDynamic(dynItem, up, settings, env, handled);
-      result.dynamics.push({ up: up.name || up.mid, id: String(dynItem.id_str || dynItem.id || ''), type: dynItem.type || '动态', bvid: extractDynamicInfo(dynItem).bvid });
-    } catch (e) {
-      var msg = '[' + (up.name || up.mid) + '] 动态视频处理失败：' + String(e.message || e);
-      result.errors.push(msg);
-      await addLog(env, 'error', msg);
-    }
-  }
   var newestInfo = extractDynamicInfo(newestVideo);
-  next.dynVideo = newestInfo.bvid;
-  next.dynVideoTitle = newestInfo.title || newestInfo.text || newestInfo.bvid;
-  next.dyn = firstId;
+  var processed = false;
+  try {
+    var didHandleDynamic = await handleDynamic(newestVideo, up, settings, env, handled, next.handled);
+    processed = true;
+    if (didHandleDynamic) result.dynamics.push({ up: up.name || up.mid, id: String(newestVideo.id_str || newestVideo.id || ''), type: newestVideo.type || '动态', bvid: newestInfo.bvid });
+  } catch (e) {
+    var msg = '[' + (up.name || up.mid) + '] 动态视频处理失败：' + String(e.message || e);
+    result.errors.push(msg);
+    await addLog(env, 'error', msg);
+  }
+  next.dyn = processed ? firstId : (old.dyn || '');
 }async function rawFetch(url, opts) {
   try {
     var resp = await fetch(url, opts || {});
@@ -911,9 +1131,9 @@ function maskSettingsForDebug(s) {
 async function debugInfo(env) {
   var out = { time: Date.now(), cookie: 'unset', settings: null, logs: [], lastSeen: null, lastRunAt: null, ups: [], errors: [] };
   try { out.settings = maskSettingsForDebug(await getSettings(env)); } catch (e) { out.errors.push('getSettings: ' + String(e && e.message || e)); }
-  try { out.logs = (await kvGet(env, 'logs', [])).slice(0, 50); } catch (e) { out.errors.push('logs: ' + String(e && e.message || e)); }
-  try { out.lastSeen = await kvGet(env, 'lastSeen', {}); } catch (e) { out.errors.push('lastSeen: ' + String(e && e.message || e)); }
-  try { out.lastRunAt = await env.BILI_MONITOR_KV.get('lastRunAt'); } catch (e) { out.errors.push('lastRunAt: ' + String(e && e.message || e)); }
+  try { out.logs = env.BILI_MONITOR_D1 ? (await getLogsFromD1(env, '')).logs.slice(0, 50) : (await kvGet(env, 'logs', [])).slice(0, 50); } catch (e) { out.errors.push('logs: ' + String(e && e.message || e)); }
+  try { out.lastSeen = await stateGet(env, 'lastSeen', {}); } catch (e) { out.errors.push('lastSeen: ' + String(e && e.message || e)); }
+  try { out.lastRunAt = await stateGet(env, 'lastRunAt', null); } catch (e) { out.errors.push('lastRunAt: ' + String(e && e.message || e)); }
   var settings = null;
   try { settings = await getSettings(env); } catch (e) { return out; }
   var cookie = settings.cookie || '';
@@ -943,7 +1163,7 @@ async function debugInfo(env) {
 
 async function overview(env) {
   var settings = await getSettings(env);
-  var lastSeen = await kvGet(env, 'lastSeen', {});
+  var lastSeen = await stateGet(env, 'lastSeen', {});
   var latest = {};
   var ups = settings.ups || [];
   for (var i = 0; i < ups.length; i++) {
@@ -955,8 +1175,19 @@ async function overview(env) {
 }
 async function checkAll(env) {
   const settings = await getSettings(env);
-  const oldMap = await kvGet(env, 'lastSeen', {});
-  kvLogBuffer = await kvGet(env, 'logs', []);
+  if (env.BILI_MONITOR_D1 && !preferredRsshubBase) {
+    try {
+      var prefRaw = await d1StateGet(env, 'preferredRsshub');
+      if (prefRaw) {
+        var pref = prefRaw;
+        try { pref = JSON.parse(prefRaw); } catch (e2) {}
+        preferredRsshubBase = String(pref || '').replace(/\/+$/, '');
+        lastPersistedRsshub = preferredRsshubBase;
+      }
+    } catch (e3) {}
+  }
+  const oldMap = await stateGet(env, 'lastSeen', {});
+  if (!env.BILI_MONITOR_D1) kvLogBuffer = await kvGet(env, 'logs', []);
   kvLogDirty = false;
   await addLog(env, 'info', '开始检查：' + settings.ups.length + ' 个UP主');
   const nextMap = {};
@@ -964,7 +1195,15 @@ async function checkAll(env) {
   const handledBvids = {};
   for (const up of settings.ups) {
     const old = oldMap[up.mid] || {};
-    nextMap[up.mid] = { video: old.video || '', videoTitle: old.videoTitle || '', dyn: old.dyn || '', dynVideo: old.dynVideo || '', dynVideoTitle: old.dynVideoTitle || '' };
+    nextMap[up.mid] = {
+      video: old.video || '',
+      videoTitle: old.videoTitle || '',
+      videoHistory: Array.isArray(old.videoHistory) ? old.videoHistory.slice() : [],
+      dyn: old.dyn || '',
+      dynVideo: old.dynVideo || '',
+      dynVideoTitle: old.dynVideoTitle || '',
+      handled: Object.assign({}, (old.handled && typeof old.handled === 'object') ? old.handled : {})
+    };
     if (up.monitorVideo !== false) {
       try {
         await checkVideos(up, settings, old, nextMap[up.mid], result, handledBvids, env);
@@ -983,21 +1222,23 @@ async function checkAll(env) {
         await addLog(env, 'error', msg);
       }
     }
+    capHandled(nextMap[up.mid].handled, 40);
   }
   if (JSON.stringify(nextMap) !== JSON.stringify(oldMap)) {
-    await kvPut(env, 'lastSeen', nextMap);
+    await statePut(env, 'lastSeen', nextMap);
   }
   await addLog(env, 'info', '检查完成：视频 ' + result.videos.length + '，动态 ' + result.dynamics.length + '，错误 ' + result.errors.length);
   await flushKvLogs(env);
+  await pruneLogsD1(env);
   return result;
 }
 
 async function scheduledCheck(env) {
   const settings = await getSettings(env);
-  const lastRaw = await env.BILI_MONITOR_KV.get('lastRunAt');
+  const lastRaw = await stateGet(env, 'lastRunAt', 0);
   const now = Date.now();
   if (lastRaw && now - Number(lastRaw) < (settings.intervalMinutes || 5) * 60000) return;
-  await env.BILI_MONITOR_KV.put('lastRunAt', String(now));
+  await statePut(env, 'lastRunAt', now);
   await checkAll(env);
 }
 
@@ -1220,12 +1461,13 @@ if (path === '/api/ups/clear-video' && method === 'POST') {
       if (!up) return json({ ok: false, error: '未找到UP主' }, 404);
       mid = up.mid;
     }
-    const last = await kvGet(env, 'lastSeen', {});
+    const last = await stateGet(env, 'lastSeen', {});
     const cur = last[mid] || {};
     cur.video = '';
     cur.videoTitle = '';
+    cur.videoHistory = [];
     last[mid] = cur;
-    await kvPut(env, 'lastSeen', last);
+    await statePut(env, 'lastSeen', last);
     await addLog(env, 'info', '[' + String(mid) + '] 已清除视频与最新视频信息');
     return json({ ok: true });
   }
@@ -1238,7 +1480,7 @@ if (path === '/api/ups/clear-video' && method === 'POST') {
     if (body.mid) up = settings.ups.find(function(u){ return u.mid === String(body.mid); });
     if (!up && body.id) up = settings.ups.find(function(u){ return u.id === body.id; });
     if (!up) return json({ ok: false, error: '未找到UP主' }, 404);
-    const last = await kvGet(env, 'lastSeen', {});
+    const last = await stateGet(env, 'lastSeen', {});
     const seen = last[up.mid] || {};
     let bvid = seen.video || '';
     let title = seen.videoTitle || '';
@@ -1330,7 +1572,13 @@ if (path === '/api/check' && method === 'POST') {
   if (path === '/api/parse-batch' && method === 'POST') {
     const body = await readJson(request);
     if (!body || !Array.isArray(body.links)) return json({ ok: false, error: '无效JSON或缺少links' }, 400);
-    var links = body.links.map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+    // 前端会传 [{url, targetPath}] 对象；这里必须保留对象，否则 String(x) 会变成 "[object Object]" 导致解析失败。
+    var links = body.links.map(function (x) {
+      if (x && typeof x === 'object') {
+        return { url: String(x.url || '').trim(), targetPath: String(x.targetPath || '').trim() };
+      }
+      return String(x || '').trim();
+    }).filter(function (x) { return typeof x === 'string' ? x : x.url; });
     if (!links.length) return json({ ok: false, error: '请输入至少一个视频链接' }, 400);
     try {
       var results = await parseBatchDownload(env, links);
@@ -1344,7 +1592,7 @@ if (path === '/api/check' && method === 'POST') {
   return json({ ok: false, error: 'Not found' }, 404);
 }
 
-const UI_HTML = "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>B站UP主监控</title>\n<style>*{box-sizing:border-box}\nbody{margin:0;font-family:'Segoe UI',system-ui,-apple-system,BlinkMacSystemFont,Roboto,'Microsoft YaHei',sans-serif;background:linear-gradient(135deg,#f2f6ff 0%,#f8fafd 42%,#eef3fb 100%);color:#1b2432;min-height:100vh}\nheader{background:linear-gradient(135deg,#141b2b 0%,#1f2a44 52%,#2f6fed 100%);color:#fff;padding:20px 28px;box-shadow:0 10px 26px rgba(18,25,45,.22)}\n.header-inner{max-width:1180px;margin:0 auto;display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap}\n.header-inner h1{margin:0;font-size:24px;letter-spacing:.3px;display:flex;align-items:center;gap:8px}\n.header-inner .sub{margin:5px 0 0;color:#c9d4ea;font-size:13px}\n.header-inner .ver{margin-left:8px;font-size:11px;font-weight:600;background:rgba(255,255,255,.16);padding:3px 9px;border-radius:999px}\n.tabs{max-width:1180px;margin:14px auto 0;display:flex;gap:10px}\n.tab{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);color:#eaf0fc;padding:9px 20px;border-radius:999px;font-size:14px;cursor:pointer;transition:background .18s,color .18s,transform .18s}\n.tab:hover{background:rgba(255,255,255,.20);transform:translateY(-1px)}\n.tab.active{background:#fff;color:#1e2a46;font-weight:700;box-shadow:0 8px 18px rgba(17,25,45,.16)}\n.wrap{max-width:1180px;margin:0 auto;padding:24px 22px 40px}\n.page{display:none}\n.page.active{display:block;animation:fadeIn .25s ease}\n@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}\n.card{background:#fff;border:1px solid #e4eaf3;border-radius:18px;padding:22px;margin-bottom:18px;box-shadow:0 12px 32px rgba(25,38,72,.07);transition:border-color .18s,box-shadow .18s}\n.card:hover{border-color:#d5deed;box-shadow:0 16px 38px rgba(25,38,72,.10)}\n.card h2{margin:0 0 16px;font-size:18px;color:#172033;display:flex;align-items:center;gap:9px}\n.card h2::before{content:'';width:4px;height:18px;border-radius:999px;background:linear-gradient(180deg,#2f6fed,#58a0ff)}\nlabel{display:block;font-size:12px;color:#66728c;font-weight:600;margin:0 0 6px;letter-spacing:.2px}\ninput,textarea{width:100%;background:#fbfcff;border:1px solid #dce3ef;border-radius:11px;padding:10px 12px;font-size:14px;font-family:inherit;color:#20293a;transition:border-color .15s,box-shadow .15s,background .15s}\ntextarea{resize:vertical;min-height:76px;line-height:1.5}\ninput:focus,textarea:focus{outline:none;border-color:#2f6fed;background:#fff;box-shadow:0 0 0 3px rgba(47,111,237,.13)}\n.row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:12px}\n.check{display:flex;align-items:center;gap:8px;font-size:14px;color:#33415c;margin:10px 0}\n.check input{width:auto}\nbutton{background:linear-gradient(135deg,#2f6fed,#3478f5);color:#fff;border:0;border-radius:11px;padding:10px 17px;font-size:13px;font-weight:600;cursor:pointer;margin-top:10px;margin-right:6px;box-shadow:0 6px 15px rgba(47,111,237,.20);transition:transform .15s,box-shadow .15s,background .15s}\nbutton:hover{box-shadow:0 8px 18px rgba(47,111,237,.28);transform:translateY(-1px)}\nbutton.gray{background:#eef2f8;color:#3b475e;box-shadow:none}\nbutton.gray:hover{background:#e2e8f2}\nbutton:disabled{opacity:.55;cursor:not-allowed;transform:none}\ntable{width:100%;border-collapse:collapse;font-size:13px;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(22,31,56,.05)}\nth,td{padding:10px 9px;border-bottom:1px solid #edf1f7;text-align:left;vertical-align:middle}\nth{background:#f6f8fc;color:#53617b;font-weight:700;letter-spacing:.2px}\ntr:hover td{background:#fafcff}\n.log{max-height:380px;overflow:auto;background:#121720;color:#d9dfea;border:1px solid #2b3446;border-radius:12px;padding:13px;font:12px/1.6 Consolas,Menlo,monospace}\n.log div{padding:4px 0;border-bottom:1px solid #272f3e}\n.log .info{color:#8db7ff}\n.log .error{color:#ff8a8a}\n.toast{position:fixed;right:20px;bottom:20px;background:#1d2637;color:#fff;padding:11px 16px;border-radius:12px;box-shadow:0 12px 28px rgba(14,20,35,.22);opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}\n.toast.show{opacity:1;transform:translateY(0)}\n.parse-result{min-height:64px;max-height:340px;overflow:auto;background:#f8fafd;border:1px solid #e2e8f2;border-radius:12px;padding:12px;font:12px/1.6 Consolas,Menlo,monospace;white-space:pre-wrap;margin-top:14px}\n.muted{color:#8792a8;font-size:12px;margin:8px 0 0}\n@media (max-width:720px){.row{grid-template-columns:1fr}.header-inner{align-items:flex-start}.tabs{flex-wrap:wrap}}</style>\n</head>\n<body>\n<header><div class=\"header-inner\"><h1>📡 B站UP主监控 <span class=\"ver\">v1.2</span></h1><p class=\"sub\">UP主更新监控 · 视频解析下载</p></div><nav class=\"tabs\"><button class=\"tab active\" id=\"tab-monitor\" onclick=\"switchPage('monitor')\">监控</button><button class=\"tab\" id=\"tab-parser\" onclick=\"switchPage('parser')\">视频解析下载</button></nav></header>\n<div class=\"wrap page active\" id=\"page-monitor\">\n<div class=\"card\"><h2>全局设置</h2>\n<label>B站 Cookie（建议粘贴含 SESSDATA 的完整Cookie）</label>\n<textarea id=\"cookie\"></textarea>\n<div class=\"row\"><div><label>企业微信 Webhook</label><input id=\"wecomWebhook\" placeholder=\"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...\"></div><div><label>下载接口前缀</label><input id=\"downloadApi\"></div></div>\n<div class=\"row\"><div><label>RSSHub 实例地址</label><textarea id=\"rsshubBase\" placeholder=\"每行一个地址，例如 https://rsshub.liumingye.cn\"></textarea></div><div></div></div>\n<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"webdavUrl\" placeholder=\"https://dav.example.com/dav/\"></div><div><label>检查间隔（分钟）</label><input id=\"intervalMinutes\" type=\"number\" min=\"1\"></div></div>\n<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"webdavUser\"></div><div><label>WebDAV 密码</label><input id=\"webdavPass\" type=\"password\"></div></div>\n<div class=\"row\"><div><label>WebDAV 默认子文件夹（自动下载）</label><input id=\"webdavDefaultFolder\" placeholder=\"默认\"></div><div></div></div>\n<div class=\"row\"><div><label>日志 WebDAV 文件完整地址</label><input id=\"logWebdavUrl\" placeholder=\"https://your-webdav/logs.json\"></div><div></div></div>\n<div class=\"row\"><div><label>下载成功日志 WebDAV 文件完整地址</label><input id=\"successLogWebdavUrl\" placeholder=\"https://your-webdav/download-success.json\"></div><div></div></div>\n<label class=\"check\"><input id=\"notifyOnFirstRun\" type=\"checkbox\"> 首次运行时也推送已存在的视频/动态</label>\n<button id=\"saveBtn\">保存设置</button> <button id=\"testWecomBtn\" class=\"gray\">测试企微</button> <button id=\"testWebdavBtn\" class=\"gray\">测试WebDAV</button>\n</div>\n<div class=\"card\"><h2>UP主管理</h2>\n<div class=\"row\"><div><label>UID 或空间链接</label><input id=\"newMid\" placeholder=\"例如 946974 或 https://space.bilibili.com/946974\"></div></div>\n<button id=\"addBtn\">添加UP主</button>\n<table style=\"margin-top:14px\"><thead><tr><th>UP主</th><th>UID</th><th>最新视频</th><th>最新动态视频</th><th>视频</th><th>动态</th><th>通知</th><th>下载</th><th></th></tr></thead><tbody id=\"upList\"></tbody></table>\n</div>\n<div class=\"card\"><div style=\"display:flex;justify-content:space-between;align-items:center\"><h2>运行日志</h2><div><button id=\"runBtn\">立即检查</button> <button id=\"refreshLogsBtn\" class=\"gray\">刷新日志</button> <button id=\"clearLogsBtn\" class=\"gray\">清除日志</button> <button id=\"downloadSuccessBtn\" class=\"gray\">下载成功记录</button> <button id=\"debugBtn\" class=\"gray\">调试</button></div></div>\n<div id=\"logs\" class=\"log\">加载中...</div>\n<div id=\"debugBox\" style=\"display:none;white-space:pre-wrap;background:#0d1117;color:#d4d8e0;border-radius:8px;padding:12px;max-height:500px;overflow:auto;font:12px Consolas,Menlo,monospace;margin-top:10px\"></div>\n<div id=\"dlProgress\" style=\"display:none;white-space:pre-wrap;background:#0d1117;color:#8fb8ff;border-radius:8px;padding:10px 12px;font:13px Consolas,Menlo,monospace;margin-top:10px\"></div>\n</div>\n</div>\n<div class=\"wrap page\" id=\"page-parser\">\n<div class=\"card\"><h2>视频解析下载</h2>\n<label>B站视频链接（每行一个）</label>\n<textarea id=\"parseLinks\" placeholder=\"https://www.bilibili.com/video/BV...\"></textarea>\n<label>上传路径（每行一个，可选；留空则自动）</label>\n<textarea id=\"parseTargetPaths\" placeholder=\"例如 天翼/我的视频/视频/哔哩哔哩/UP主名称\"></textarea>\n<div class=\"row\"><div><label>解析接口前缀</label><input id=\"parseApiBase\"></div><div><label>默认文件夹</label><input id=\"parseDefaultFolder\" placeholder=\"默认\"></div></div>\n<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"parseWebdavUrl\"></div><div></div></div>\n<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"parseWebdavUser\"></div><div><label>WebDAV 密码</label><input id=\"parseWebdavPass\" type=\"password\"></div></div>\n<p class=\"muted\">下载后优先存入对应UP主名称文件夹；不存在则存入默认文件夹。</p>\n<button id=\"saveParseSettingsBtn\" class=\"gray\">保存解析设置</button> <button id=\"parseBtn\">开始解析并下载</button>\n<div id=\"parseResult\" class=\"parse-result\"></div>\n</div>\n</div>\n<div id=\"toast\" class=\"toast\"></div>\n<script>\nvar state={settings:null,latest:{}};\nfunction $(id){return document.getElementById(id);}\nfunction on(id,evt,fn){var el=$(id);if(el){el.addEventListener(evt,fn);}}\nfunction toast(msg){var el=$(\"toast\");el.textContent=msg;el.className=\"toast show\";setTimeout(function(){el.className=\"toast\";},2200);}\nfunction api(path,opts){opts=opts||{};opts.headers=Object.assign({\"Content-Type\":\"application/json\"},opts.headers||{});return fetch(path,opts).then(function(r){return r.json();});}\nfunction collectSettings(){\n  function val(id, def){var el=document.getElementById(id); return el ? el.value : (def==null?'':def);}\n  function checked(id){var el=document.getElementById(id); return el ? !!el.checked : false;}\n  return {\n    cookie: val('cookie'),\n    wecomWebhook: val('wecomWebhook'),\n    downloadApi: val('downloadApi','https://bili.kedaya.gq/api/download?url='),\n    rsshubBase: val('rsshubBase','https://rsshub.liumingye.cn'),\n    webdavUrl: val('webdavUrl'),\n    webdavUser: val('webdavUser'),\n    webdavPass: val('webdavPass'),\n    webdavDefaultFolder: val('webdavDefaultFolder','默认'),\n    logWebdavUrl: val('logWebdavUrl'),\n    successLogWebdavUrl: val('successLogWebdavUrl'),\n    intervalMinutes: Number(val('intervalMinutes','5'))||5,\n    notifyOnFirstRun: checked('notifyOnFirstRun'),\n    parseApiBase: val('parseApiBase','https://bili.kedaya.gq/api?url='),\n    parseWebdavUrl: val('parseWebdavUrl'),\n    parseWebdavUser: val('parseWebdavUser'),\n    parseWebdavPass: val('parseWebdavPass'),\n    parseDefaultFolder: val('parseDefaultFolder','默认'),\n    ups: state.settings ? state.settings.ups : []\n  };\n}\nfunction fillSettings(s){state.settings=s||{};function setVal(id,val){var el=document.getElementById(id);if(!el){return;}if(el.type==='checkbox'){el.checked=!!val;}else{el.value=(val===null||val===undefined)?'':val;}}setVal('cookie',s.cookie);setVal('wecomWebhook',s.wecomWebhook);setVal('downloadApi',s.downloadApi||'https://bili.kedaya.gq/api/download?url=');setVal('rsshubBase',s.rsshubBase||'https://rsshub.liumingye.cn');setVal('webdavUrl',s.webdavUrl);setVal('webdavUser',s.webdavUser);setVal('webdavPass',s.webdavPass);setVal('webdavDefaultFolder',s.webdavDefaultFolder||'默认');setVal('logWebdavUrl',s.logWebdavUrl);setVal('successLogWebdavUrl',s.successLogWebdavUrl||'');\nsetVal('intervalMinutes',s.intervalMinutes||5);setVal('notifyOnFirstRun',s.notifyOnFirstRun);setVal('parseApiBase',s.parseApiBase||'https://bili.kedaya.gq/api?url=');setVal('parseWebdavUrl',s.parseWebdavUrl);setVal('parseWebdavUser',s.parseWebdavUser);setVal('parseWebdavPass',s.parseWebdavPass);setVal('parseDefaultFolder',s.parseDefaultFolder||'默认');try{renderUps();}catch(e){} }\nfunction makeTd(text){var td=document.createElement(\"td\");td.textContent=text;return td;}\nfunction makeCheck(checked,onChange){var td=document.createElement(\"td\");var input=document.createElement(\"input\");input.type=\"checkbox\";input.checked=!!checked;input.addEventListener(\"change\",function(e){onChange(e.target.checked);});td.appendChild(input);return td;}\nfunction updateUpFlag(id,field,val){var patch={};patch[field]=val;api(\"/api/ups/update\",{method:\"POST\",body:JSON.stringify({id:id,patch:patch})}).then(function(j){if(!j||!j.ok){toast(j&&j.error||\"更新失败\");return;}var u=(state.settings.ups||[]).find(function(x){return x.id===id;});if(u){u[field]=val;}renderUps();}).catch(function(){toast(\"更新失败\");});}\nfunction clearUpVideo(id,mid){if(!confirm(\"确认清除该UP主的视频与最新视频信息？\"))return;api(\"/api/ups/clear-video\",{method:\"POST\",body:JSON.stringify({id:id,mid:mid})}).then(function(j){if(j&&j.ok){toast(\"已清除\");loadOverview();}else{toast(j&&j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}\nfunction manualDownload(id,mid){if(!confirm(\"手动下载当前UP主的最新视频？\"))return;var box=$(\"dlProgress\");box.style.display=\"block\";box.textContent=\"准备下载...\";var timer=setInterval(function(){api(\"/api/download-progress\").then(function(j){if(j&&j.ok&&j.progress){box.textContent=(j.progress.message||\"\")+(j.progress.percent?\" (\"+j.progress.percent+\"%)\":\"\");}}).catch(function(){});},1000);api(\"/api/ups/manual-download\",{method:\"POST\",body:JSON.stringify({id:id,mid:mid})}).then(function(j){clearInterval(timer);if(j&&j.ok){box.textContent=\"手动下载成功\";toast(\"手动下载成功\");}else{box.textContent=j&&j.error||\"下载失败\";toast(j&&j.error||\"下载失败\");}loadLogs();loadOverview();}).catch(function(){clearInterval(timer);box.textContent=\"下载请求失败\";toast(\"下载请求失败\");loadLogs();});}\nfunction renderUps(){var ups=(state.settings&&state.settings.ups)||[];state.upPage=state.upPage||1;state.upCompact=!!state.upCompact;var perPage=state.upCompact?50:5;var total=Math.max(1,Math.ceil(ups.length/perPage));if(state.upPage>total)state.upPage=total;var start=(state.upPage-1)*perPage;var pageUps=ups.slice(start,start+perPage);var table=$('upList');var compactList=$('upCompactList');var ctrl=$('upControls');if(!compactList){compactList=document.createElement('div');compactList.id='upCompactList';compactList.style.cssText='display:none;margin-top:12px';table.parentNode.insertBefore(compactList,table);}if(!ctrl){ctrl=document.createElement('div');ctrl.id='upControls';ctrl.style.cssText='display:flex;align-items:center;gap:10px;margin:14px 0;flex-wrap:wrap';var prev=document.createElement('button');prev.className='gray';prev.textContent='上一页';prev.style.cssText='margin:0';var infoEl=document.createElement('span');infoEl.id='upPageInfo';infoEl.style.cssText='font-size:13px;color:#66728c';var next=document.createElement('button');next.className='gray';next.textContent='下一页';next.style.cssText='margin:0';var mode=document.createElement('button');mode.id='upCompactBtn';mode.className='gray';mode.style.cssText='margin:0';mode.textContent='缩略模式';prev.addEventListener('click',function(){if(state.upPage>1){state.upPage=state.upPage-1;renderUps();}});next.addEventListener('click',function(){if(state.upPage<total){state.upPage=state.upPage+1;renderUps();}});mode.addEventListener('click',function(){state.upCompact=!state.upCompact;renderUps();});ctrl.appendChild(prev);ctrl.appendChild(infoEl);ctrl.appendChild(next);ctrl.appendChild(mode);table.parentNode.insertBefore(ctrl,table);}var infoEl=$('upPageInfo');var modeBtn=$('upCompactBtn');if(infoEl)infoEl.textContent='第 '+state.upPage+' / '+total+' 页';if(modeBtn)modeBtn.textContent=state.upCompact?'详细模式':'缩略模式';if(!ups.length){ctrl.style.display='none';table.style.display='none';compactList.style.display='none';return;}ctrl.style.display='flex';if(state.upCompact){table.style.display='none';compactList.style.display='grid';compactList.style.gridTemplateColumns='repeat(5,1fr)';compactList.style.gap='10px';compactList.innerHTML='';pageUps.forEach(function(u){var item=document.createElement('div');item.className='up-compact-item';var nameBtn=document.createElement('button');nameBtn.className='up-compact-name';nameBtn.textContent=(u.name||'未命名');nameBtn.addEventListener('click',function(){openUpDetailModal(u,(state.latest&&state.latest[u.mid])||{});});item.appendChild(nameBtn);compactList.appendChild(item);});return;}table.style.display='';compactList.style.display='none';table.innerHTML='';pageUps.forEach(function(u){var tr=document.createElement('tr');tr.appendChild(makeTd(u.name||'未命名'));tr.appendChild(makeTd(u.mid));var info=(state.latest&&state.latest[u.mid])||{};var latestTd=document.createElement('td');if(info.video){var a=document.createElement('a');a.textContent=info.videoTitle||info.video;a.href='https://www.bilibili.com/video/'+encodeURIComponent(info.video);a.target='_blank';a.rel='noopener';latestTd.appendChild(a);}else{latestTd.textContent='暂无';}var dynTd=document.createElement('td');if(info.dynVideo){var da=document.createElement('a');da.textContent=info.dynVideoTitle||info.dynVideo;da.href='https://www.bilibili.com/video/'+encodeURIComponent(info.dynVideo);da.target='_blank';da.rel='noopener';dynTd.appendChild(da);}else{dynTd.textContent='暂无';}tr.appendChild(latestTd);tr.appendChild(dynTd);tr.appendChild(makeCheck(u.monitorVideo!==false,function(v){u.monitorVideo=v;updateUpFlag(u.id,'monitorVideo',v);}));tr.appendChild(makeCheck(u.monitorDynamic!==false,function(v){u.monitorDynamic=v;updateUpFlag(u.id,'monitorDynamic',v);}));tr.appendChild(makeCheck(u.notify!==false,function(v){u.notify=v;updateUpFlag(u.id,'notify',v);}));tr.appendChild(makeCheck(u.download!==false,function(v){u.download=v;updateUpFlag(u.id,'download',v);}));var actTd=document.createElement('td');var manualBtn=document.createElement('button');manualBtn.textContent='手动下载';manualBtn.className='gray';manualBtn.style.cssText='margin:0 6px 0 0;padding:8px 12px';manualBtn.addEventListener('click',function(){manualDownload(u.id,u.mid);});actTd.appendChild(manualBtn);var clearBtn=document.createElement('button');clearBtn.textContent='清除视频信息';clearBtn.className='gray';clearBtn.style.cssText='margin:0 6px 0 0;padding:8px 12px';clearBtn.addEventListener('click',function(){clearUpVideo(u.id,u.mid);});actTd.appendChild(clearBtn);var del=document.createElement('button');del.textContent='删除';del.className='gray';del.style.cssText='margin:0';del.addEventListener('click',function(){deleteUp(u.id);});actTd.appendChild(del);tr.appendChild(actTd);table.appendChild(tr);});}function debugNow(){var btn=$(\"debugBtn\");btn.disabled=true;var box=$(\"debugBox\");api(\"/api/debug\").then(function(j){if(!j||!j.ok){box.textContent=\"调试失败：\"+(j&&j.error||\"\");}else{box.textContent=JSON.stringify(j.debug||j,null,2);}box.style.display=\"block\";toast(j&&j.ok?\"调试完成\":\"调试失败\");}).catch(function(){box.textContent=\"调试请求失败\";box.style.display=\"block\";toast(\"调试请求失败\");}).finally(function(){btn.disabled=false;});}\nfunction loadOverview(){api(\"/api/overview\").then(function(j){if(j&&j.ok){state.latest=j.latest||{};renderUps();}}).catch(function(){});}\nfunction loadSettings(){api('/api/settings').then(function(j){if(j&&j.ok){fillSettings(j.settings||{});}else{toast((j&&j.error)||'加载失败');}}).catch(function(e){toast('加载失败：'+(e&&e.message||e));var db=document.getElementById('debugBox');if(db){db.style.display='block';db.textContent='全局设置加载失败：'+(e&&e.message||e);}});}\nfunction saveSettings(){var data=collectSettings();api(\"/api/settings\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){if(j.ok){toast(\"已保存\");state.settings=j.settings||data;renderUps();}else{toast(j.error||\"保存失败\");}}).catch(function(){toast(\"保存失败\");});}\nfunction addUp(){var mid=$(\"newMid\").value.trim();if(!mid){toast(\"请输入UID或链接\");return;}api(\"/api/ups\",{method:\"POST\",body:JSON.stringify({mid:mid})}).then(function(j){if(j.ok){toast(\"已添加\");$(\"newMid\").value=\"\";loadSettings();}else{toast(j.error||\"添加失败\");}}).catch(function(){toast(\"添加失败\");});}function deleteUp(id){if(!confirm(\"确认删除该UP主？\"))return;api(\"/api/ups/delete\",{method:\"POST\",body:JSON.stringify({id:id})}).then(function(j){if(j.ok){toast(\"已删除\");loadSettings();}else{toast(j.error||\"删除失败\");}}).catch(function(){toast(\"删除失败\");});}\nfunction runNow(){api(\"/api/check\",{method:\"POST\"}).then(function(j){toast(j.ok?\"检查完成\":(j.error||\"检查失败\"));loadLogs();loadOverview();}).catch(function(){toast(\"检查失败\");loadLogs();loadOverview();});}\nfunction testWecom(){var data=collectSettings();api(\"/api/test-wecom\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"企微测试成功\":(j.error||\"测试失败\"));loadLogs();}).catch(function(){toast(\"测试失败\");loadLogs();});}\nfunction testWebdav(){var data=collectSettings();api(\"/api/test-webdav\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"WebDAV连接成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}\nfunction clearLogs(){if(!confirm(\"确认清除所有运行日志？\"))return;api(\"/api/logs/clear\",{method:\"POST\"}).then(function(j){if(j.ok){toast(\"日志已清除\");loadLogs();}else{toast(j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}\nfunction loadLogs(date){var box=$('logs');if(!box)return;var sel=$('logDateSelect');if(!sel){var wrap=document.createElement('div');wrap.style.margin='10px 0';var lab=document.createElement('label');lab.textContent='日志日期';var s=document.createElement('select');s.id='logDateSelect';s.style.marginLeft='8px';wrap.appendChild(lab);wrap.appendChild(s);box.parentNode.insertBefore(wrap,box);s.addEventListener('change',function(){loadLogs(s.value);});sel=s;}var qs=date?('?date='+encodeURIComponent(date)):'';api('/api/logs'+qs).then(function(j){box.innerHTML='';sel.innerHTML='';if(!j||!j.ok){box.textContent='加载失败';return;}var logs=j.logs||[];var dates=j.dates||[];if(!dates.length){var seen={};logs.forEach(function(l){var d=new Date(l.t+8*3600000).toISOString().slice(0,10);if(!seen[d]){seen[d]=1;dates.push(d);}});dates.sort().reverse();}var activeDate=date||dates[0]||'';dates.forEach(function(d){var o=document.createElement('option');o.value=d;o.textContent=d;if(d===activeDate)o.selected=true;sel.appendChild(o);});var filtered=activeDate?logs.filter(function(l){return new Date(l.t+8*3600000).toISOString().slice(0,10)===activeDate;}):logs;if(!filtered.length){box.textContent='暂无日志';return;}filtered.forEach(function(l){var div=document.createElement('div');div.className=l.level||'info';var t=new Date(l.t).toLocaleString('zh-CN',{hour12:false});div.textContent='['+t+'] '+l.msg;box.appendChild(div);});}).catch(function(){box.textContent='加载失败';});}$(\"saveBtn\").addEventListener(\"click\",saveSettings);\n$(\"addBtn\").addEventListener(\"click\",addUp);\n$(\"runBtn\").addEventListener(\"click\",runNow);\n$(\"refreshLogsBtn\").addEventListener(\"click\",loadLogs);\n$(\"clearLogsBtn\").addEventListener(\"click\",clearLogs);\n$(\"debugBtn\").addEventListener(\"click\",debugNow);\n$(\"testWecomBtn\").addEventListener(\"click\",testWecom);\n$(\"testWebdavBtn\").addEventListener(\"click\",testWebdav);\nfunction switchPage(name){var tabs=document.querySelectorAll(\".tab\");tabs.forEach(function(t){t.classList.toggle(\"active\",t.id===\"tab-\"+name);});var pages=document.querySelectorAll(\".page\");pages.forEach(function(p){p.classList.toggle(\"active\",p.id===\"page-\"+name);});}\nfunction parseBatch(){var box=$('parseResult');var linksEl=$('parseLinks');var pathsEl=$('parseTargetPaths');var btn=$('parseBtn');if(!box||!linksEl||!pathsEl||!btn){toast('页面未就绪，请刷新后再试');return;}box.textContent='开始解析...';var links=linksEl.value.split(String.fromCharCode(10)).map(function(x){return x.trim();}).filter(Boolean);var paths=pathsEl.value.split(String.fromCharCode(10)).map(function(x){return x.trim();});if(!links.length){box.textContent='请至少输入一个视频链接';return;}var payload=links.map(function(url,i){return {url:url,targetPath:paths[i]||''};});btn.disabled=true;api('/api/parse-batch',{method:'POST',body:JSON.stringify({links:payload})}).then(function(j){if(!j||!j.ok){box.textContent=j&&j.error||'请求失败';return;}var lines=j.results.map(function(r){return (r.ok?'✅ ':'❌ ')+r.title+' | '+r.bvid+' | '+(r.folder||'')+(r.ok?'':(' | '+r.error));});box.textContent=lines.join(String.fromCharCode(10));toast(j.okCount+'/'+j.results.length+' 成功');}).catch(function(){box.textContent='请求失败';toast('请求失败');}).finally(function(){btn.disabled=false;});}\non(\"saveParseSettingsBtn\",\"click\",saveSettings);\non(\"parseBtn\",\"click\",parseBatch);\nfunction loadDownloadSuccess(){api('/api/download-success').then(function(j){var m=document.createElement('div');m.id='downloadSuccessModal';m.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999';var b=document.createElement('div');b.style.cssText='background:#fff;border-radius:12px;width:min(980px,92vw);max-height:82vh;overflow:auto;padding:18px';var h=document.createElement('div');h.style.cssText='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px';var t=document.createElement('h3');t.textContent='下载成功记录';var c=document.createElement('button');c.className='gray';c.textContent='关闭';c.onclick=function(){m.remove();};h.appendChild(t);h.appendChild(c);b.appendChild(h);var tb=document.createElement('table');tb.style.width='100%';var tr=document.createElement('tr');['时间','UP主','BV号','标题','视频链接','WebDAV路径'].forEach(function(x){var th=document.createElement('th');th.textContent=x;tr.appendChild(th);});tb.appendChild(tr);var body=document.createElement('tbody');tb.appendChild(body);if(!j||!j.ok){var row=document.createElement('tr');var td=document.createElement('td');td.colSpan=6;td.textContent=(j&&j.error)||'加载失败';row.appendChild(td);body.appendChild(row);}else{var rs=j.records||[];if(!rs.length){var row=document.createElement('tr');var td=document.createElement('td');td.colSpan=6;td.textContent='暂无记录';row.appendChild(td);body.appendChild(row);}else{rs.forEach(function(r){var row=document.createElement('tr');[new Date(r.t).toLocaleString('zh-CN',{hour12:false}),r.upName,r.bvid,r.title,r.videoUrl,r.webdavPath].forEach(function(v){var td=document.createElement('td');td.textContent=v||'';td.style.cssText='vertical-align:top;word-break:break-all';row.appendChild(td);});body.appendChild(row);});}}b.appendChild(tb);m.appendChild(b);document.body.appendChild(m);}).catch(function(){toast('加载下载成功记录失败');});}\non('downloadSuccessBtn','click',loadDownloadSuccess);\nfunction openUpDetailModal(u,info){var old=document.getElementById('upModal');if(old)old.remove();var style=document.getElementById('upModalStyle');if(!style){style=document.createElement('style');style.id='upModalStyle';style.textContent='.up-modal-root{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px}.up-modal-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.45);backdrop-filter:blur(4px);opacity:0;transition:opacity .25s ease}.up-modal-card{position:relative;width:min(520px,100%);max-height:82vh;overflow:auto;background:#fff;border:1px solid #e4eaf3;border-radius:18px;box-shadow:0 24px 60px rgba(10,18,38,.28);padding:20px;opacity:0;transform:translateY(16px) scale(.97);transition:opacity .3s ease,transform .3s cubic-bezier(.16,1,.3,1)}.up-modal-root.open .up-modal-backdrop{opacity:1}.up-modal-root.open .up-modal-card{opacity:1;transform:none}.up-modal-close{position:absolute;top:14px;right:14px;width:32px;height:32px;border-radius:10px;background:#eef2f8;color:#3b475e;border:0;cursor:pointer;font-size:18px;line-height:1;box-shadow:none;margin:0}.up-modal-title{font-size:18px;font-weight:700;color:#172033;margin:0 40px 16px 0}.up-modal-row{font-size:13px;color:#33415c;margin:10px 0}.up-modal-check{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#33415c;margin-right:14px}.up-modal-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}';document.head.appendChild(style);}var root=document.createElement('div');root.className='up-modal-root';root.id='upModal';var back=document.createElement('div');back.className='up-modal-backdrop';var card=document.createElement('div');card.className='up-modal-card';var close=document.createElement('button');close.className='up-modal-close';close.type='button';close.textContent='×';close.addEventListener('click',function(){root.classList.remove('open');setTimeout(function(){root.remove();},260);});var title=document.createElement('div');title.className='up-modal-title';title.textContent=(u.name||'未命名')+' · '+u.mid;card.appendChild(close);card.appendChild(title);function mkLink(label,bvid){var d=document.createElement('div');d.className='up-modal-row';if(bvid){var a=document.createElement('a');a.textContent=label||bvid;a.href='https://www.bilibili.com/video/'+encodeURIComponent(bvid);a.target='_blank';a.rel='noopener';d.appendChild(a);}else{d.textContent=label||'暂无';}return d;}card.appendChild(mkLink('最新视频：'+(info.videoTitle||info.video),info.video));card.appendChild(mkLink('最新动态视频：'+(info.dynVideoTitle||info.dynVideo),info.dynVideo));var checks=document.createElement('div');checks.style.cssText='margin:14px 0';function mkCheck(lab,val,fn){var l=document.createElement('label');l.className='up-modal-check';var inp=document.createElement('input');inp.type='checkbox';inp.checked=!!val;inp.addEventListener('change',function(e){fn(e.target.checked);});l.appendChild(inp);l.appendChild(document.createTextNode(lab));return l;}checks.appendChild(mkCheck('视频',u.monitorVideo!==false,function(v){u.monitorVideo=v;updateUpFlag(u.id,'monitorVideo',v);}));checks.appendChild(mkCheck('动态',u.monitorDynamic!==false,function(v){u.monitorDynamic=v;updateUpFlag(u.id,'monitorDynamic',v);}));checks.appendChild(mkCheck('通知',u.notify!==false,function(v){u.notify=v;updateUpFlag(u.id,'notify',v);}));checks.appendChild(mkCheck('下载',u.download!==false,function(v){u.download=v;updateUpFlag(u.id,'download',v);}));card.appendChild(checks);var acts=document.createElement('div');acts.className='up-modal-actions';function mkBtn(txt,fn){var b=document.createElement('button');b.className='gray';b.textContent=txt;b.style.cssText='margin:0;padding:8px 12px';b.addEventListener('click',fn);return b;}acts.appendChild(mkBtn('手动下载',function(){manualDownload(u.id,u.mid);}));acts.appendChild(mkBtn('清除视频信息',function(){clearUpVideo(u.id,u.mid);}));acts.appendChild(mkBtn('删除',function(){deleteUp(u.id);}));card.appendChild(acts);root.appendChild(back);root.appendChild(card);document.body.appendChild(root);requestAnimationFrame(function(){root.classList.add('open');});back.addEventListener('click',function(){root.classList.remove('open');setTimeout(function(){root.remove();},260);});}function setupCollapsible(){var st=document.createElement('style');st.textContent=`.card.section{padding:0;overflow:hidden}.card.section>.section-head{width:100%;background:transparent;border:0;display:flex;align-items:center;gap:10px;padding:14px 16px;font-size:17px;font-weight:700;color:#172033;cursor:pointer;margin:0;box-shadow:none}.card.section>.section-head:before{content:'−';width:22px;height:22px;line-height:20px;text-align:center;border-radius:7px;background:#eef2f8;color:#3b475e;transition:transform .3s ease}.card.section.collapsed>.section-head:before{content:'+';transform:rotate(0deg)}.card.section>.section-body{display:grid;grid-template-rows:1fr;transition:grid-template-rows .3s ease}.card.section.collapsed>.section-body{grid-template-rows:0fr}.card.section>.section-body>.section-inner{overflow:hidden;min-height:0;padding:0 16px 16px}.up-compact-item{background:#fff;border:1px solid #e4eaf3;border-radius:12px;padding:12px;margin-bottom:10px;box-shadow:0 8px 20px rgba(25,38,72,.05);transition:box-shadow .2s ease}.up-compact-item:hover{box-shadow:0 12px 24px rgba(25,38,72,.09)}.up-compact-name{background:transparent;border:0;color:#1e2a46;font-weight:700;font-size:15px;cursor:pointer;padding:0;margin:0;box-shadow:none}.up-compact-detail{display:none;padding-top:10px;animation:fadeIn .25s ease}`;document.head.appendChild(st);document.querySelectorAll('.card').forEach(function(card){if(card.dataset.collapse==='1')return;card.dataset.collapse='1';card.classList.add('section');var h=card.querySelector('h2');var head=document.createElement('button');head.className='section-head';head.type='button';if(h){head.textContent=h.textContent;h.remove();}else{head.textContent='折叠区域';}var body=document.createElement('div');body.className='section-body';var inner=document.createElement('div');inner.className='section-inner';while(card.firstChild){inner.appendChild(card.firstChild);}card.appendChild(head);card.appendChild(body);body.appendChild(inner);if(head.textContent.indexOf('全局设置')>=0)card.classList.add('collapsed');head.addEventListener('click',function(){card.classList.toggle('collapsed');});});}setupCollapsible();loadSettings();loadLogs();loadOverview();setInterval(function(){loadLogs();loadOverview();},15000);\n</script>\n</body>\n</html>";
+const UI_HTML = "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>B站UP主监控</title>\n<style>*{box-sizing:border-box}\nbody{margin:0;font-family:'Segoe UI',system-ui,-apple-system,BlinkMacSystemFont,Roboto,'Microsoft YaHei',sans-serif;background:linear-gradient(135deg,#f2f6ff 0%,#f8fafd 42%,#eef3fb 100%);color:#1b2432;min-height:100vh}\nheader{background:linear-gradient(135deg,#141b2b 0%,#1f2a44 52%,#2f6fed 100%);color:#fff;padding:20px 28px;box-shadow:0 10px 26px rgba(18,25,45,.22)}\n.header-inner{max-width:1180px;margin:0 auto;display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap}\n.header-inner h1{margin:0;font-size:24px;letter-spacing:.3px;display:flex;align-items:center;gap:8px}\n.header-inner .sub{margin:5px 0 0;color:#c9d4ea;font-size:13px}\n.header-inner .ver{margin-left:8px;font-size:11px;font-weight:600;background:rgba(255,255,255,.16);padding:3px 9px;border-radius:999px}\n.tabs{max-width:1180px;margin:14px auto 0;display:flex;gap:10px}\n.tab{background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);color:#eaf0fc;padding:9px 20px;border-radius:999px;font-size:14px;cursor:pointer;transition:background .18s,color .18s,transform .18s}\n.tab:hover{background:rgba(255,255,255,.20);transform:translateY(-1px)}\n.tab.active{background:#fff;color:#1e2a46;font-weight:700;box-shadow:0 8px 18px rgba(17,25,45,.16)}\n.wrap{max-width:1180px;margin:0 auto;padding:24px 22px 40px}\n.page{display:none}\n.page.active{display:block;animation:fadeIn .25s ease}\n@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}\n.card{background:#fff;border:1px solid #e4eaf3;border-radius:18px;padding:22px;margin-bottom:18px;box-shadow:0 12px 32px rgba(25,38,72,.07);transition:border-color .18s,box-shadow .18s}\n.card:hover{border-color:#d5deed;box-shadow:0 16px 38px rgba(25,38,72,.10)}\n.card h2{margin:0 0 16px;font-size:18px;color:#172033;display:flex;align-items:center;gap:9px}\n.card h2::before{content:'';width:4px;height:18px;border-radius:999px;background:linear-gradient(180deg,#2f6fed,#58a0ff)}\nlabel{display:block;font-size:12px;color:#66728c;font-weight:600;margin:0 0 6px;letter-spacing:.2px}\ninput,textarea{width:100%;background:#fbfcff;border:1px solid #dce3ef;border-radius:11px;padding:10px 12px;font-size:14px;font-family:inherit;color:#20293a;transition:border-color .15s,box-shadow .15s,background .15s}\ntextarea{resize:vertical;min-height:76px;line-height:1.5}\ninput:focus,textarea:focus{outline:none;border-color:#2f6fed;background:#fff;box-shadow:0 0 0 3px rgba(47,111,237,.13)}\n.row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:12px}\n.check{display:flex;align-items:center;gap:8px;font-size:14px;color:#33415c;margin:10px 0}\n.check input{width:auto}\nbutton{background:linear-gradient(135deg,#2f6fed,#3478f5);color:#fff;border:0;border-radius:11px;padding:10px 17px;font-size:13px;font-weight:600;cursor:pointer;margin-top:10px;margin-right:6px;box-shadow:0 6px 15px rgba(47,111,237,.20);transition:transform .15s,box-shadow .15s,background .15s}\nbutton:hover{box-shadow:0 8px 18px rgba(47,111,237,.28);transform:translateY(-1px)}\nbutton.gray{background:#eef2f8;color:#3b475e;box-shadow:none}\nbutton.gray:hover{background:#e2e8f2}\nbutton:disabled{opacity:.55;cursor:not-allowed;transform:none}\ntable{width:100%;border-collapse:collapse;font-size:13px;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(22,31,56,.05)}\nth,td{padding:10px 9px;border-bottom:1px solid #edf1f7;text-align:left;vertical-align:middle}\nth{background:#f6f8fc;color:#53617b;font-weight:700;letter-spacing:.2px}\ntr:hover td{background:#fafcff}\n.log{max-height:380px;overflow:auto;background:#121720;color:#d9dfea;border:1px solid #2b3446;border-radius:12px;padding:13px;font:12px/1.6 Consolas,Menlo,monospace}\n.log div{padding:4px 0;border-bottom:1px solid #272f3e}\n.log .info{color:#8db7ff}\n.log .error{color:#ff8a8a}\n.toast{position:fixed;right:20px;bottom:20px;background:#1d2637;color:#fff;padding:11px 16px;border-radius:12px;box-shadow:0 12px 28px rgba(14,20,35,.22);opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}\n.toast.show{opacity:1;transform:translateY(0)}\n.parse-result{min-height:64px;max-height:340px;overflow:auto;background:#f8fafd;border:1px solid #e2e8f2;border-radius:12px;padding:12px;font:12px/1.6 Consolas,Menlo,monospace;white-space:pre-wrap;margin-top:14px}\n.muted{color:#8792a8;font-size:12px;margin:8px 0 0}\n@media (max-width:720px){.row{grid-template-columns:1fr}.header-inner{align-items:flex-start}.tabs{flex-wrap:wrap}}</style>\n</head>\n<body>\n<header><div class=\"header-inner\"><h1>📡 B站UP主监控 <span class=\"ver\">v1.2</span></h1><p class=\"sub\">UP主更新监控 · 视频解析下载</p></div><nav class=\"tabs\"><button class=\"tab active\" id=\"tab-monitor\" onclick=\"switchPage('monitor')\">监控</button><button class=\"tab\" id=\"tab-parser\" onclick=\"switchPage('parser')\">视频解析下载</button></nav></header>\n<div class=\"wrap page active\" id=\"page-monitor\">\n<div class=\"card\"><h2>全局设置</h2>\n<label>B站 Cookie（建议粘贴含 SESSDATA 的完整Cookie）</label>\n<textarea id=\"cookie\"></textarea>\n<div class=\"row\"><div><label>企业微信 Webhook</label><input id=\"wecomWebhook\" placeholder=\"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...\"></div><div><label>下载接口前缀</label><input id=\"downloadApi\"></div></div>\n<div class=\"row\"><div><label>RSSHub 实例地址</label><textarea id=\"rsshubBase\" placeholder=\"每行一个地址，例如 https://rsshub.liumingye.cn\"></textarea></div><div></div></div>\n<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"webdavUrl\" placeholder=\"https://dav.example.com/dav/\"></div><div><label>检查间隔（分钟）</label><input id=\"intervalMinutes\" type=\"number\" min=\"1\"></div></div>\n<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"webdavUser\"></div><div><label>WebDAV 密码</label><input id=\"webdavPass\" type=\"password\"></div></div>\n<div class=\"row\"><div><label>WebDAV 默认子文件夹（自动下载）</label><input id=\"webdavDefaultFolder\" placeholder=\"默认\"></div><div></div></div>\n<div class=\"row\"><div><label>日志 WebDAV 文件完整地址</label><input id=\"logWebdavUrl\" placeholder=\"https://your-webdav/logs.json\"></div><div></div></div>\n<div class=\"row\"><div><label>下载成功日志 WebDAV 文件完整地址</label><input id=\"successLogWebdavUrl\" placeholder=\"https://your-webdav/download-success.json\"></div><div></div></div>\n<label class=\"check\"><input id=\"notifyOnFirstRun\" type=\"checkbox\"> 首次运行时也推送已存在的视频/动态</label>\n<button id=\"saveBtn\">保存设置</button> <button id=\"testWecomBtn\" class=\"gray\">测试企微</button> <button id=\"testWebdavBtn\" class=\"gray\">测试WebDAV</button>\n</div>\n<div class=\"card\"><h2>UP主管理</h2>\n<div class=\"row\"><div><label>UID 或空间链接</label><input id=\"newMid\" placeholder=\"例如 946974 或 https://space.bilibili.com/946974\"></div></div>\n<button id=\"addBtn\">添加UP主</button>\n<table style=\"margin-top:14px\"><thead><tr><th>UP主</th><th>UID</th><th>最新视频</th><th>最新动态视频</th><th>视频</th><th>动态</th><th>通知</th><th>下载</th><th></th></tr></thead><tbody id=\"upList\"></tbody></table>\n</div>\n<div class=\"card\"><div style=\"display:flex;justify-content:space-between;align-items:center\"><h2>运行日志</h2><div><button id=\"runBtn\">立即检查</button> <button id=\"refreshLogsBtn\" class=\"gray\">刷新日志</button> <button id=\"clearLogsBtn\" class=\"gray\">清除日志</button> <button id=\"downloadSuccessBtn\" class=\"gray\">下载成功记录</button> <button id=\"debugBtn\" class=\"gray\">调试</button></div></div>\n<div id=\"logs\" class=\"log\">加载中...</div>\n<div id=\"debugBox\" style=\"display:none;white-space:pre-wrap;background:#0d1117;color:#d4d8e0;border-radius:8px;padding:12px;max-height:500px;overflow:auto;font:12px Consolas,Menlo,monospace;margin-top:10px\"></div>\n<div id=\"dlProgress\" style=\"display:none;white-space:pre-wrap;background:#0d1117;color:#8fb8ff;border-radius:8px;padding:10px 12px;font:13px Consolas,Menlo,monospace;margin-top:10px\"></div>\n</div>\n</div>\n<div class=\"wrap page\" id=\"page-parser\">\n<div class=\"card\"><h2>视频解析下载</h2>\n<label>B站视频链接（每行一个）</label>\n<textarea id=\"parseLinks\" placeholder=\"https://www.bilibili.com/video/BV...\"></textarea>\n<label>上传路径（每行一个，可选；留空则自动）</label>\n<textarea id=\"parseTargetPaths\" placeholder=\"例如 天翼/我的视频/视频/哔哩哔哩/UP主名称\"></textarea>\n<div class=\"row\"><div><label>解析接口前缀</label><input id=\"parseApiBase\"></div><div><label>默认文件夹</label><input id=\"parseDefaultFolder\" placeholder=\"默认\"></div></div>\n<div class=\"row\"><div><label>WebDAV 地址</label><input id=\"parseWebdavUrl\"></div><div></div></div>\n<div class=\"row\"><div><label>WebDAV 用户名</label><input id=\"parseWebdavUser\"></div><div><label>WebDAV 密码</label><input id=\"parseWebdavPass\" type=\"password\"></div></div>\n<p class=\"muted\">下载后优先存入对应UP主名称文件夹；不存在则存入默认文件夹。</p>\n<button id=\"saveParseSettingsBtn\" class=\"gray\">保存解析设置</button> <button id=\"parseBtn\">开始解析并下载</button>\n<div id=\"parseResult\" class=\"parse-result\"></div>\n</div>\n</div>\n<div id=\"toast\" class=\"toast\"></div>\n<script>\nvar state={settings:null,latest:{}};\nfunction $(id){return document.getElementById(id);}\nfunction on(id,evt,fn){var el=$(id);if(el){el.addEventListener(evt,fn);}}\nfunction toast(msg){var el=$(\"toast\");el.textContent=msg;el.className=\"toast show\";setTimeout(function(){el.className=\"toast\";},2200);}\nfunction api(path,opts){opts=opts||{};opts.headers=Object.assign({\"Content-Type\":\"application/json\"},opts.headers||{});return fetch(path,opts).then(function(r){return r.json();});}\nfunction collectSettings(){\n  function val(id, def){var el=document.getElementById(id); return el ? el.value : (def==null?'':def);}\n  function checked(id){var el=document.getElementById(id); return el ? !!el.checked : false;}\n  return {\n    cookie: val('cookie'),\n    wecomWebhook: val('wecomWebhook'),\n    downloadApi: val('downloadApi','https://bili.kedaya.gq/api/download?url='),\n    rsshubBase: val('rsshubBase','https://rsshub.liumingye.cn'),\n    webdavUrl: val('webdavUrl'),\n    webdavUser: val('webdavUser'),\n    webdavPass: val('webdavPass'),\n    webdavDefaultFolder: val('webdavDefaultFolder','默认'),\n    logWebdavUrl: val('logWebdavUrl'),\n    successLogWebdavUrl: val('successLogWebdavUrl'),\n    intervalMinutes: Number(val('intervalMinutes','5'))||5,\n    notifyOnFirstRun: checked('notifyOnFirstRun'),\n    parseApiBase: val('parseApiBase','https://bili.kedaya.gq/api?url='),\n    parseWebdavUrl: val('parseWebdavUrl'),\n    parseWebdavUser: val('parseWebdavUser'),\n    parseWebdavPass: val('parseWebdavPass'),\n    parseDefaultFolder: val('parseDefaultFolder','默认'),\n    ups: state.settings ? state.settings.ups : []\n  };\n}\nfunction fillSettings(s){state.settings=s||{};function setVal(id,val){var el=document.getElementById(id);if(!el){return;}if(el.type==='checkbox'){el.checked=!!val;}else{el.value=(val===null||val===undefined)?'':val;}}setVal('cookie',s.cookie);setVal('wecomWebhook',s.wecomWebhook);setVal('downloadApi',s.downloadApi||'https://bili.kedaya.gq/api/download?url=');setVal('rsshubBase',s.rsshubBase||'https://rsshub.liumingye.cn');setVal('webdavUrl',s.webdavUrl);setVal('webdavUser',s.webdavUser);setVal('webdavPass',s.webdavPass);setVal('webdavDefaultFolder',s.webdavDefaultFolder||'默认');setVal('logWebdavUrl',s.logWebdavUrl);setVal('successLogWebdavUrl',s.successLogWebdavUrl||'');\nsetVal('intervalMinutes',s.intervalMinutes||5);setVal('notifyOnFirstRun',s.notifyOnFirstRun);setVal('parseApiBase',s.parseApiBase||'https://bili.kedaya.gq/api?url=');setVal('parseWebdavUrl',s.parseWebdavUrl);setVal('parseWebdavUser',s.parseWebdavUser);setVal('parseWebdavPass',s.parseWebdavPass);setVal('parseDefaultFolder',s.parseDefaultFolder||'默认');try{renderUps();}catch(e){} }\nfunction makeTd(text){var td=document.createElement(\"td\");td.textContent=text;return td;}\nfunction makeCheck(checked,onChange){var td=document.createElement(\"td\");var input=document.createElement(\"input\");input.type=\"checkbox\";input.checked=!!checked;input.addEventListener(\"change\",function(e){onChange(e.target.checked);});td.appendChild(input);return td;}\nfunction updateUpFlag(id,field,val){var patch={};patch[field]=val;api(\"/api/ups/update\",{method:\"POST\",body:JSON.stringify({id:id,patch:patch})}).then(function(j){if(!j||!j.ok){toast(j&&j.error||\"更新失败\");return;}var u=(state.settings.ups||[]).find(function(x){return x.id===id;});if(u){u[field]=val;}renderUps();}).catch(function(){toast(\"更新失败\");});}\nfunction clearUpVideo(id,mid){if(!confirm(\"确认清除该UP主的视频与最新视频信息？\"))return;api(\"/api/ups/clear-video\",{method:\"POST\",body:JSON.stringify({id:id,mid:mid})}).then(function(j){if(j&&j.ok){toast(\"已清除\");loadOverview();}else{toast(j&&j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}\nfunction manualDownload(id,mid){if(!confirm(\"手动下载当前UP主的最新视频？\"))return;var box=$(\"dlProgress\");box.style.display=\"block\";box.textContent=\"准备下载...\";var timer=setInterval(function(){api(\"/api/download-progress\").then(function(j){if(j&&j.ok&&j.progress){box.textContent=(j.progress.message||\"\")+(j.progress.percent?\" (\"+j.progress.percent+\"%)\":\"\");}}).catch(function(){});},1000);api(\"/api/ups/manual-download\",{method:\"POST\",body:JSON.stringify({id:id,mid:mid})}).then(function(j){clearInterval(timer);if(j&&j.ok){box.textContent=\"手动下载成功\";toast(\"手动下载成功\");}else{box.textContent=j&&j.error||\"下载失败\";toast(j&&j.error||\"下载失败\");}loadLogs();loadOverview();}).catch(function(){clearInterval(timer);box.textContent=\"下载请求失败\";toast(\"下载请求失败\");loadLogs();});}\nfunction renderUps(){var ups=(state.settings&&state.settings.ups)||[];state.upPage=state.upPage||1;state.upCompact=!!state.upCompact;var perPage=state.upCompact?50:5;var total=Math.max(1,Math.ceil(ups.length/perPage));if(state.upPage>total)state.upPage=total;var start=(state.upPage-1)*perPage;var pageUps=ups.slice(start,start+perPage);var table=$('upList');var compactList=$('upCompactList');var ctrl=$('upControls');if(!compactList){compactList=document.createElement('div');compactList.id='upCompactList';compactList.style.cssText='display:none;margin-top:12px';table.parentNode.insertBefore(compactList,table);}if(!ctrl){ctrl=document.createElement('div');ctrl.id='upControls';ctrl.style.cssText='display:flex;align-items:center;gap:10px;margin:14px 0;flex-wrap:wrap';var prev=document.createElement('button');prev.className='gray';prev.textContent='上一页';prev.style.cssText='margin:0';var infoEl=document.createElement('span');infoEl.id='upPageInfo';infoEl.style.cssText='font-size:13px;color:#66728c';var next=document.createElement('button');next.className='gray';next.textContent='下一页';next.style.cssText='margin:0';var mode=document.createElement('button');mode.id='upCompactBtn';mode.className='gray';mode.style.cssText='margin:0';mode.textContent='缩略模式';prev.addEventListener('click',function(){if(state.upPage>1){state.upPage=state.upPage-1;renderUps();}});next.addEventListener('click',function(){if(state.upPage<total){state.upPage=state.upPage+1;renderUps();}});mode.addEventListener('click',function(){state.upCompact=!state.upCompact;renderUps();});ctrl.appendChild(prev);ctrl.appendChild(infoEl);ctrl.appendChild(next);ctrl.appendChild(mode);table.parentNode.insertBefore(ctrl,table);}var infoEl=$('upPageInfo');var modeBtn=$('upCompactBtn');if(infoEl)infoEl.textContent='第 '+state.upPage+' / '+total+' 页';if(modeBtn)modeBtn.textContent=state.upCompact?'详细模式':'缩略模式';if(!ups.length){ctrl.style.display='none';table.style.display='none';compactList.style.display='none';return;}ctrl.style.display='flex';if(state.upCompact){table.style.display='none';compactList.style.display='grid';compactList.style.gridTemplateColumns='repeat(5,1fr)';compactList.style.gap='10px';compactList.innerHTML='';pageUps.forEach(function(u){var item=document.createElement('div');item.className='up-compact-item';var nameBtn=document.createElement('button');nameBtn.className='up-compact-name';nameBtn.textContent=(u.name||'未命名');nameBtn.addEventListener('click',function(){openUpDetailModal(u,(state.latest&&state.latest[u.mid])||{});});item.appendChild(nameBtn);compactList.appendChild(item);});return;}table.style.display='';compactList.style.display='none';table.innerHTML='';pageUps.forEach(function(u){var tr=document.createElement('tr');tr.appendChild(makeTd(u.name||'未命名'));tr.appendChild(makeTd(u.mid));var info=(state.latest&&state.latest[u.mid])||{};var latestTd=document.createElement('td');if(info.video){var a=document.createElement('a');a.textContent=info.videoTitle||info.video;a.href='https://www.bilibili.com/video/'+encodeURIComponent(info.video);a.target='_blank';a.rel='noopener';latestTd.appendChild(a);}else{latestTd.textContent='暂无';}var dynTd=document.createElement('td');if(info.dynVideo){var da=document.createElement('a');da.textContent=info.dynVideoTitle||info.dynVideo;da.href='https://www.bilibili.com/video/'+encodeURIComponent(info.dynVideo);da.target='_blank';da.rel='noopener';dynTd.appendChild(da);}else{dynTd.textContent='暂无';}tr.appendChild(latestTd);tr.appendChild(dynTd);tr.appendChild(makeCheck(u.monitorVideo!==false,function(v){u.monitorVideo=v;updateUpFlag(u.id,'monitorVideo',v);}));tr.appendChild(makeCheck(u.monitorDynamic!==false,function(v){u.monitorDynamic=v;updateUpFlag(u.id,'monitorDynamic',v);}));tr.appendChild(makeCheck(u.notify!==false,function(v){u.notify=v;updateUpFlag(u.id,'notify',v);}));tr.appendChild(makeCheck(u.download!==false,function(v){u.download=v;updateUpFlag(u.id,'download',v);}));var actTd=document.createElement('td');var manualBtn=document.createElement('button');manualBtn.textContent='手动下载';manualBtn.className='gray';manualBtn.style.cssText='margin:0 6px 0 0;padding:8px 12px';manualBtn.addEventListener('click',function(){manualDownload(u.id,u.mid);});actTd.appendChild(manualBtn);var clearBtn=document.createElement('button');clearBtn.textContent='清除视频信息';clearBtn.className='gray';clearBtn.style.cssText='margin:0 6px 0 0;padding:8px 12px';clearBtn.addEventListener('click',function(){clearUpVideo(u.id,u.mid);});actTd.appendChild(clearBtn);var del=document.createElement('button');del.textContent='删除';del.className='gray';del.style.cssText='margin:0';del.addEventListener('click',function(){deleteUp(u.id);});actTd.appendChild(del);tr.appendChild(actTd);table.appendChild(tr);});}function debugNow(){var btn=$(\"debugBtn\");btn.disabled=true;var box=$(\"debugBox\");api(\"/api/debug\").then(function(j){if(!j||!j.ok){box.textContent=\"调试失败：\"+(j&&j.error||\"\");}else{box.textContent=JSON.stringify(j.debug||j,null,2);}box.style.display=\"block\";toast(j&&j.ok?\"调试完成\":\"调试失败\");}).catch(function(){box.textContent=\"调试请求失败\";box.style.display=\"block\";toast(\"调试请求失败\");}).finally(function(){btn.disabled=false;});}\nfunction loadOverview(){api(\"/api/overview\").then(function(j){if(j&&j.ok){state.latest=j.latest||{};renderUps();}}).catch(function(){});}\nfunction loadSettings(){api('/api/settings').then(function(j){if(j&&j.ok){fillSettings(j.settings||{});}else{toast((j&&j.error)||'加载失败');}}).catch(function(e){toast('加载失败：'+(e&&e.message||e));var db=document.getElementById('debugBox');if(db){db.style.display='block';db.textContent='全局设置加载失败：'+(e&&e.message||e);}});}\nfunction saveSettings(){var data=collectSettings();api(\"/api/settings\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){if(j.ok){toast(\"已保存\");state.settings=j.settings||data;renderUps();}else{toast(j.error||\"保存失败\");}}).catch(function(){toast(\"保存失败\");});}\nfunction addUp(){var mid=$(\"newMid\").value.trim();if(!mid){toast(\"请输入UID或链接\");return;}api(\"/api/ups\",{method:\"POST\",body:JSON.stringify({mid:mid})}).then(function(j){if(j.ok){toast(\"已添加\");$(\"newMid\").value=\"\";loadSettings();}else{toast(j.error||\"添加失败\");}}).catch(function(){toast(\"添加失败\");});}function deleteUp(id){if(!confirm(\"确认删除该UP主？\"))return;api(\"/api/ups/delete\",{method:\"POST\",body:JSON.stringify({id:id})}).then(function(j){if(j.ok){toast(\"已删除\");loadSettings();}else{toast(j.error||\"删除失败\");}}).catch(function(){toast(\"删除失败\");});}\nfunction runNow(){api(\"/api/check\",{method:\"POST\"}).then(function(j){toast(j.ok?\"检查完成\":(j.error||\"检查失败\"));loadLogs();loadOverview();}).catch(function(){toast(\"检查失败\");loadLogs();loadOverview();});}\nfunction testWecom(){var data=collectSettings();api(\"/api/test-wecom\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"企微测试成功\":(j.error||\"测试失败\"));loadLogs();}).catch(function(){toast(\"测试失败\");loadLogs();});}\nfunction testWebdav(){var data=collectSettings();api(\"/api/test-webdav\",{method:\"POST\",body:JSON.stringify(data)}).then(function(j){toast(j.ok?\"WebDAV连接成功\":(j.error||\"测试失败\"));}).catch(function(){toast(\"测试失败\");});}\nfunction clearLogs(){if(!confirm(\"确认清除所有运行日志？\"))return;api(\"/api/logs/clear\",{method:\"POST\"}).then(function(j){if(j.ok){toast(\"日志已清除\");loadLogs();}else{toast(j.error||\"清除失败\");}}).catch(function(){toast(\"清除失败\");});}\nfunction loadLogs(date){var box=$('logs');if(!box)return;var sel=$('logDateSelect');if(!sel){var wrap=document.createElement('div');wrap.style.margin='10px 0';var lab=document.createElement('label');lab.textContent='日志日期';var s=document.createElement('select');s.id='logDateSelect';s.style.marginLeft='8px';wrap.appendChild(lab);wrap.appendChild(s);box.parentNode.insertBefore(wrap,box);s.addEventListener('change',function(){loadLogs(s.value);});sel=s;}var qs=date?('?date='+encodeURIComponent(date)):'';api('/api/logs'+qs).then(function(j){box.innerHTML='';sel.innerHTML='';if(!j||!j.ok){box.textContent='加载失败';return;}var logs=j.logs||[];var dates=j.dates||[];if(!dates.length){var seen={};logs.forEach(function(l){var d=new Date(l.t+8*3600000).toISOString().slice(0,10);if(!seen[d]){seen[d]=1;dates.push(d);}});dates.sort().reverse();}var activeDate=date||dates[0]||'';dates.forEach(function(d){var o=document.createElement('option');o.value=d;o.textContent=d;if(d===activeDate)o.selected=true;sel.appendChild(o);});var filtered=activeDate?logs.filter(function(l){return new Date(l.t+8*3600000).toISOString().slice(0,10)===activeDate;}):logs;if(!filtered.length){box.textContent='暂无日志';return;}filtered.forEach(function(l){var div=document.createElement('div');div.className=l.level||'info';var t=new Date(l.t).toLocaleString('zh-CN',{hour12:false});div.textContent='['+t+'] '+l.msg;box.appendChild(div);});}).catch(function(){box.textContent='加载失败';});}on(\"saveBtn\",\"click\",saveSettings);\non(\"addBtn\",\"click\",addUp);\non(\"runBtn\",\"click\",runNow);\non(\"refreshLogsBtn\",\"click\",function(){loadLogs();});\non(\"clearLogsBtn\",\"click\",clearLogs);\non(\"debugBtn\",\"click\",debugNow);\non(\"testWecomBtn\",\"click\",testWecom);\non(\"testWebdavBtn\",\"click\",testWebdav);\nfunction switchPage(name){var tabs=document.querySelectorAll(\".tab\");tabs.forEach(function(t){t.classList.toggle(\"active\",t.id===\"tab-\"+name);});var pages=document.querySelectorAll(\".page\");pages.forEach(function(p){p.classList.toggle(\"active\",p.id===\"page-\"+name);});}\nfunction parseBatch(){var box=$('parseResult');var linksEl=$('parseLinks');var pathsEl=$('parseTargetPaths');var btn=$('parseBtn');if(!box||!linksEl||!pathsEl||!btn){toast('页面未就绪，请刷新后再试');return;}box.textContent='开始解析...';var links=linksEl.value.split(String.fromCharCode(10)).map(function(x){return x.trim();}).filter(Boolean);var paths=pathsEl.value.split(String.fromCharCode(10)).map(function(x){return x.trim();});if(!links.length){box.textContent='请至少输入一个视频链接';return;}var payload=links.map(function(url,i){return {url:url,targetPath:paths[i]||''};});btn.disabled=true;api('/api/parse-batch',{method:'POST',body:JSON.stringify({links:payload})}).then(function(j){if(!j||!j.ok){box.textContent=j&&j.error||'请求失败';return;}var lines=j.results.map(function(r){return (r.ok?'✅ ':'❌ ')+r.title+' | '+r.bvid+' | '+(r.folder||'')+(r.ok?'':(' | '+r.error));});box.textContent=lines.join(String.fromCharCode(10));toast(j.okCount+'/'+j.results.length+' 成功');}).catch(function(){box.textContent='请求失败';toast('请求失败');}).finally(function(){btn.disabled=false;});}\non(\"saveParseSettingsBtn\",\"click\",saveSettings);\non(\"parseBtn\",\"click\",parseBatch);\nfunction loadDownloadSuccess(){api('/api/download-success').then(function(j){var m=document.createElement('div');m.id='downloadSuccessModal';m.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999';var b=document.createElement('div');b.style.cssText='background:#fff;border-radius:12px;width:min(980px,92vw);max-height:82vh;overflow:auto;padding:18px';var h=document.createElement('div');h.style.cssText='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px';var t=document.createElement('h3');t.textContent='下载成功记录';var c=document.createElement('button');c.className='gray';c.textContent='关闭';c.onclick=function(){m.remove();};h.appendChild(t);h.appendChild(c);b.appendChild(h);var tb=document.createElement('table');tb.style.width='100%';var tr=document.createElement('tr');['时间','UP主','BV号','标题','视频链接','WebDAV路径'].forEach(function(x){var th=document.createElement('th');th.textContent=x;tr.appendChild(th);});tb.appendChild(tr);var body=document.createElement('tbody');tb.appendChild(body);if(!j||!j.ok){var row=document.createElement('tr');var td=document.createElement('td');td.colSpan=6;td.textContent=(j&&j.error)||'加载失败';row.appendChild(td);body.appendChild(row);}else{var rs=j.records||[];if(!rs.length){var row=document.createElement('tr');var td=document.createElement('td');td.colSpan=6;td.textContent='暂无记录';row.appendChild(td);body.appendChild(row);}else{rs.forEach(function(r){var row=document.createElement('tr');[new Date(r.t).toLocaleString('zh-CN',{hour12:false}),r.upName,r.bvid,r.title,r.videoUrl,r.webdavPath].forEach(function(v){var td=document.createElement('td');td.textContent=v||'';td.style.cssText='vertical-align:top;word-break:break-all';row.appendChild(td);});body.appendChild(row);});}}b.appendChild(tb);m.appendChild(b);document.body.appendChild(m);}).catch(function(){toast('加载下载成功记录失败');});}\non('downloadSuccessBtn','click',loadDownloadSuccess);\nfunction openUpDetailModal(u,info){var old=document.getElementById('upModal');if(old)old.remove();var style=document.getElementById('upModalStyle');if(!style){style=document.createElement('style');style.id='upModalStyle';style.textContent='.up-modal-root{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px}.up-modal-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.45);backdrop-filter:blur(4px);opacity:0;transition:opacity .25s ease}.up-modal-card{position:relative;width:min(520px,100%);max-height:82vh;overflow:auto;background:#fff;border:1px solid #e4eaf3;border-radius:18px;box-shadow:0 24px 60px rgba(10,18,38,.28);padding:20px;opacity:0;transform:translateY(16px) scale(.97);transition:opacity .3s ease,transform .3s cubic-bezier(.16,1,.3,1)}.up-modal-root.open .up-modal-backdrop{opacity:1}.up-modal-root.open .up-modal-card{opacity:1;transform:none}.up-modal-close{position:absolute;top:14px;right:14px;width:32px;height:32px;border-radius:10px;background:#eef2f8;color:#3b475e;border:0;cursor:pointer;font-size:18px;line-height:1;box-shadow:none;margin:0}.up-modal-title{font-size:18px;font-weight:700;color:#172033;margin:0 40px 16px 0}.up-modal-row{font-size:13px;color:#33415c;margin:10px 0}.up-modal-check{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#33415c;margin-right:14px}.up-modal-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}';document.head.appendChild(style);}var root=document.createElement('div');root.className='up-modal-root';root.id='upModal';var back=document.createElement('div');back.className='up-modal-backdrop';var card=document.createElement('div');card.className='up-modal-card';var close=document.createElement('button');close.className='up-modal-close';close.type='button';close.textContent='×';close.addEventListener('click',function(){root.classList.remove('open');setTimeout(function(){root.remove();},260);});var title=document.createElement('div');title.className='up-modal-title';title.textContent=(u.name||'未命名')+' · '+u.mid;card.appendChild(close);card.appendChild(title);function mkLink(label,bvid){var d=document.createElement('div');d.className='up-modal-row';if(bvid){var a=document.createElement('a');a.textContent=label||bvid;a.href='https://www.bilibili.com/video/'+encodeURIComponent(bvid);a.target='_blank';a.rel='noopener';d.appendChild(a);}else{d.textContent=label||'暂无';}return d;}card.appendChild(mkLink('最新视频：'+(info.videoTitle||info.video),info.video));card.appendChild(mkLink('最新动态视频：'+(info.dynVideoTitle||info.dynVideo),info.dynVideo));var checks=document.createElement('div');checks.style.cssText='margin:14px 0';function mkCheck(lab,val,fn){var l=document.createElement('label');l.className='up-modal-check';var inp=document.createElement('input');inp.type='checkbox';inp.checked=!!val;inp.addEventListener('change',function(e){fn(e.target.checked);});l.appendChild(inp);l.appendChild(document.createTextNode(lab));return l;}checks.appendChild(mkCheck('视频',u.monitorVideo!==false,function(v){u.monitorVideo=v;updateUpFlag(u.id,'monitorVideo',v);}));checks.appendChild(mkCheck('动态',u.monitorDynamic!==false,function(v){u.monitorDynamic=v;updateUpFlag(u.id,'monitorDynamic',v);}));checks.appendChild(mkCheck('通知',u.notify!==false,function(v){u.notify=v;updateUpFlag(u.id,'notify',v);}));checks.appendChild(mkCheck('下载',u.download!==false,function(v){u.download=v;updateUpFlag(u.id,'download',v);}));card.appendChild(checks);var acts=document.createElement('div');acts.className='up-modal-actions';function mkBtn(txt,fn){var b=document.createElement('button');b.className='gray';b.textContent=txt;b.style.cssText='margin:0;padding:8px 12px';b.addEventListener('click',fn);return b;}acts.appendChild(mkBtn('手动下载',function(){manualDownload(u.id,u.mid);}));acts.appendChild(mkBtn('清除视频信息',function(){clearUpVideo(u.id,u.mid);}));acts.appendChild(mkBtn('删除',function(){deleteUp(u.id);}));card.appendChild(acts);root.appendChild(back);root.appendChild(card);document.body.appendChild(root);requestAnimationFrame(function(){root.classList.add('open');});back.addEventListener('click',function(){root.classList.remove('open');setTimeout(function(){root.remove();},260);});}function setupCollapsible(){var st=document.createElement('style');st.textContent=`.card.section{padding:0;overflow:hidden}.card.section>.section-head{width:100%;background:transparent;border:0;display:flex;align-items:center;gap:10px;padding:14px 16px;font-size:17px;font-weight:700;color:#172033;cursor:pointer;margin:0;box-shadow:none}.card.section>.section-head:before{content:'−';width:22px;height:22px;line-height:20px;text-align:center;border-radius:7px;background:#eef2f8;color:#3b475e;transition:transform .3s ease}.card.section.collapsed>.section-head:before{content:'+';transform:rotate(0deg)}.card.section>.section-body{display:grid;grid-template-rows:1fr;transition:grid-template-rows .3s ease}.card.section.collapsed>.section-body{grid-template-rows:0fr}.card.section>.section-body>.section-inner{overflow:hidden;min-height:0;padding:0 16px 16px}.up-compact-item{background:#fff;border:1px solid #e4eaf3;border-radius:12px;padding:12px;margin-bottom:10px;box-shadow:0 8px 20px rgba(25,38,72,.05);transition:box-shadow .2s ease}.up-compact-item:hover{box-shadow:0 12px 24px rgba(25,38,72,.09)}.up-compact-name{background:transparent;border:0;color:#1e2a46;font-weight:700;font-size:15px;cursor:pointer;padding:0;margin:0;box-shadow:none}.up-compact-detail{display:none;padding-top:10px;animation:fadeIn .25s ease}`;document.head.appendChild(st);document.querySelectorAll('.card').forEach(function(card){if(card.dataset.collapse==='1')return;card.dataset.collapse='1';card.classList.add('section');var h=card.querySelector('h2');var head=document.createElement('button');head.className='section-head';head.type='button';if(h){head.textContent=h.textContent;h.remove();}else{head.textContent='折叠区域';}var body=document.createElement('div');body.className='section-body';var inner=document.createElement('div');inner.className='section-inner';while(card.firstChild){inner.appendChild(card.firstChild);}card.appendChild(head);card.appendChild(body);body.appendChild(inner);if(head.textContent.indexOf('全局设置')>=0)card.classList.add('collapsed');head.addEventListener('click',function(){card.classList.toggle('collapsed');});});}setupCollapsible();loadSettings();loadLogs();loadOverview();setInterval(function(){loadLogs();loadOverview();},15000);\n</script>\n</body>\n</html>";
 
 export default {
   async fetch(request, env) {
