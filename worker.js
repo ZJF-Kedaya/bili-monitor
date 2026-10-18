@@ -679,13 +679,18 @@ function base64Encode(str) {
   return out;
 }
 
-async function sendWeCom(webhook, kind, author, title, url, env) {
+async function sendWeCom(webhook, kind, author, title, url, env, extraLines) {
   const lines = [
     '**B站更新提醒：' + kind + '**',
     'UP主：' + (author || '未知'),
     '内容：' + truncate(title, 500),
     '链接：' + url
   ];
+  if (Array.isArray(extraLines)) {
+    for (var i = 0; i < extraLines.length; i++) {
+      if (extraLines[i]) lines.push(String(extraLines[i]));
+    }
+  }
   const resp = await fetch(webhook, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -759,7 +764,12 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var dest = base + '/' + folder + '/' + filename;
   var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream' };
   var upload;
-  if (manual && typeof download.body.tee === 'function') {
+  // 目标文件已存在视为上传成功：避免上次上传实际已写入但状态码异常时被反复重下重传。
+  if (await webdavFileExists(base, folder, filename, auth)) {
+    if (manual) await writeDlProgress(env, { stage: 'done', message: '文件已存在，跳过上传', percent: 100 });
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 目标文件已存在，跳上传：' + folderName + '/' + fileBaseName);
+    upload = { status: 200 };
+  } else if (manual && typeof download.body.tee === 'function') {
     var branches = download.body.tee();
     var uploadStream = branches[0];
     var progressStream = branches[1];
@@ -805,8 +815,15 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
       await deleteUpFolderIndex(env, up.mid);
       await addLog(env, 'error', '[' + (up.name || up.mid) + '] 索引中的UP主文件夹已失效，已清除索引，下次将重新探测：' + folderName);
     }
-    if (manual) await writeDlProgress(env, { stage: 'error', message: 'WebDAV 上传失败 HTTP ' + upload.status, percent: 0 });
-    throw new Error('WebDAV 上传失败 HTTP ' + upload.status);
+    // 405 通常是目标目录不存在或服务端拒绝写入，先补建目录，下一轮重试时可直接成功。
+    if (upload.status === 405 || upload.status === 409) {
+      await ensureWebdavFolder(base, folder, auth);
+    }
+    var uploadErr = 'WebDAV 上传失败 HTTP ' + upload.status;
+    if (manual) await writeDlProgress(env, { stage: 'error', message: uploadErr, percent: 0 });
+    var err = new Error(uploadErr);
+    err.stage = 'upload';
+    throw err;
   }
   if (manual) await writeDlProgress(env, { stage: 'done', message: '上传完成', percent: 100 });
   await addLog(env, 'info', '[' + (up.name || up.mid) + '] 已上传：' + folderName + '/' + fileBaseName);
@@ -916,18 +933,26 @@ async function handleVideo(item, up, settings, env, handled, persist) {
   const title = item.title || '无标题';
   const author = item.author || up.name || up.mid;
   const url = 'https://www.bilibili.com/video/' + bvid;
+  // 下载/上传失败不再阻断后续流程：先把错误记下来，供通知提示和上抛使用。
+  var uploadError = '';
+  if (needDownload && !downloadDone) {
+    try {
+      var didDownload = await performOnce(entry, 'downloadDone', 'downloadTried', function () {
+        return downloadAndUploadVideo(settings, up, bvid, title, env);
+      });
+      if (didDownload) markHandled(persist, bvid, 'd');
+    } catch (e) {
+      uploadError = String(e && e.message || e);
+      await addLog(env, 'error', '[' + (up.name || up.mid) + '] 视频下载上传失败：' + uploadError + '（BV ' + bvid + '）');
+    }
+  }
   if (needNotify && !notifyDone) {
     var didNotify = await performOnce(entry, 'notifyDone', 'notifyTried', function () {
-      return sendWeCom(settings.wecomWebhook, '新视频', author, title, url, env);
+      return sendWeCom(settings.wecomWebhook, '新视频', author, title, url, env, uploadError ? ['<font color="warning">该视频上传失败</font>'] : null);
     });
     if (didNotify) markHandled(persist, bvid, 'n');
   }
-  if (needDownload && !downloadDone) {
-    var didDownload = await performOnce(entry, 'downloadDone', 'downloadTried', function () {
-      return downloadAndUploadVideo(settings, up, bvid, title, env);
-    });
-    if (didDownload) markHandled(persist, bvid, 'd');
-  }
+  if (uploadError) throw new Error(uploadError);
   return true;
 }
 
@@ -946,18 +971,25 @@ async function handleDynamic(item, up, settings, env, handled, persist) {
   }
   const url = /^\d+$/.test(info.id) ? 'https://t.bilibili.com/' + info.id : 'https://space.bilibili.com/' + String(up.mid) + '/dynamic';
   const text = info.text || info.type || '（无文字）';
+  var uploadError = '';
+  if (needDownload && !downloadDone) {
+    try {
+      var didDownload = await performOnce(entry, 'downloadDone', 'downloadTried', function () {
+        return downloadAndUploadVideo(settings, up, bvid, info.title || info.text || info.id, env);
+      });
+      if (didDownload) markHandled(persist, bvid, 'd');
+    } catch (e) {
+      uploadError = String(e && e.message || e);
+      await addLog(env, 'error', '[' + (up.name || up.mid) + '] 动态视频下载上传失败：' + uploadError + '（BV ' + bvid + '）');
+    }
+  }
   if (needNotify && !notifyDone) {
     var didNotify = await performOnce(entry, 'notifyDone', 'notifyTried', function () {
-      return sendWeCom(settings.wecomWebhook, '新动态', info.author || up.name || up.mid, text, url, env);
+      return sendWeCom(settings.wecomWebhook, '新动态', info.author || up.name || up.mid, text, url, env, uploadError ? ['<font color="warning">该视频上传失败</font>'] : null);
     });
     if (didNotify) markHandled(persist, bvid, 'n');
   }
-  if (needDownload && !downloadDone) {
-    var didDownload = await performOnce(entry, 'downloadDone', 'downloadTried', function () {
-      return downloadAndUploadVideo(settings, up, bvid, info.title || info.text || info.id, env);
-    });
-    if (didDownload) markHandled(persist, bvid, 'd');
-  }
+  if (uploadError) throw new Error(uploadError);
   return true;
 }
 
@@ -1023,25 +1055,18 @@ async function checkVideos(up, settings, old, next, result, handled, env) {
     return;
   }
   const latest = fresh[0];
-  var processed = false;
   try {
     var didHandleVideo = await handleVideo(latest, up, settings, env, handled, next.handled);
-    processed = true;
     if (didHandleVideo) result.videos.push({ up: up.name || up.mid, bvid: latest.bvid, title: latest.title || '' });
   } catch (e) {
+    // 通知已完成、仅上传失败时也照常推进基线，避免同一个视频每轮反复重试形成死循环。
     const msg = '[' + (up.name || up.mid) + '] 视频处理失败：' + String(e.message || e);
     result.errors.push(msg);
-    await addLog(env, 'error', msg);
+    await addLog(env, 'error', msg + '（已记录最新视频，不再重复处理）');
   }
-  if (processed) {
-    next.video = first.bvid;
-    next.videoTitle = first.title || '';
-    rememberHistory();
-  } else {
-    next.video = old.video || '';
-    next.videoTitle = old.videoTitle || '';
-    next.videoHistory = history;
-  }
+  next.video = first.bvid;
+  next.videoTitle = first.title || '';
+  rememberHistory();
 }
 async function checkDynamics(up, settings, old, next, result, handled, env) {
   const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env);
@@ -1102,18 +1127,18 @@ async function checkDynamics(up, settings, old, next, result, handled, env) {
   if (!videoItems.length) { next.dyn = firstId; return; }
   var newestVideo = videoItems[0];
   var newestInfo = extractDynamicInfo(newestVideo);
-  var processed = false;
   try {
     var didHandleDynamic = await handleDynamic(newestVideo, up, settings, env, handled, next.handled);
-    processed = true;
     if (didHandleDynamic) result.dynamics.push({ up: up.name || up.mid, id: String(newestVideo.id_str || newestVideo.id || ''), type: newestVideo.type || '动态', bvid: newestInfo.bvid });
   } catch (e) {
+    // 上传失败也要推进动态基线，否则每轮都会重新拉取并重复通知同一动态。
     var msg = '[' + (up.name || up.mid) + '] 动态视频处理失败：' + String(e.message || e);
     result.errors.push(msg);
-    await addLog(env, 'error', msg);
+    await addLog(env, 'error', msg + '（已记录最新动态，不再重复处理）');
   }
-  next.dyn = processed ? firstId : (old.dyn || '');
-}async function rawFetch(url, opts) {
+  next.dyn = firstId;
+}
+async function rawFetch(url, opts) {
   try {
     var resp = await fetch(url, opts || {});
     var text = await resp.text().catch(function(){ return ''; });
