@@ -592,25 +592,28 @@ async function deleteUpFolderIndex(env, mid) {
 var kvLogBuffer=[];
 var kvLogDirty=false;
 async function addLog(env, level, msg) {
-  if (env.BILI_MONITOR_D1) {
-    try {
-      await saveLogsToD1(env, [{ t: Date.now(), level: level, msg: String(msg) }]);
-    } catch (e) {}
-    return;
-  }
-  var settings = await getSettings(env);
-  if (settings.logWebdavUrl) {
-    try {
-      var wdLogs = await getLogsFromWebdav(settings);
-      wdLogs.unshift({ t: Date.now(), level: level, msg: String(msg) });
-      if (wdLogs.length > 300) wdLogs.length = 300;
-      await saveLogsToWebdav(settings, wdLogs);
-    } catch (e) {}
-    return;
-  }
-  kvLogBuffer.unshift({ t: Date.now(), level: level, msg: String(msg) });
-  if (kvLogBuffer.length > 200) kvLogBuffer.length = 200;
-  kvLogDirty = true;
+  // 写日志失败（KV/WebDAV 抖动）绝不允许影响主流程，否则会被误判成业务失败。
+  try {
+    if (env.BILI_MONITOR_D1) {
+      try {
+        await saveLogsToD1(env, [{ t: Date.now(), level: level, msg: String(msg) }]);
+      } catch (e) {}
+      return;
+    }
+    var settings = await getSettings(env);
+    if (settings.logWebdavUrl) {
+      try {
+        var wdLogs = await getLogsFromWebdav(settings);
+        wdLogs.unshift({ t: Date.now(), level: level, msg: String(msg) });
+        if (wdLogs.length > 300) wdLogs.length = 300;
+        await saveLogsToWebdav(settings, wdLogs);
+      } catch (e) {}
+      return;
+    }
+    kvLogBuffer.unshift({ t: Date.now(), level: level, msg: String(msg) });
+    if (kvLogBuffer.length > 200) kvLogBuffer.length = 200;
+    kvLogDirty = true;
+  } catch (e) {}
 }
 async function flushKvLogs(env) {
   if (!kvLogDirty) return;
@@ -721,6 +724,63 @@ async function readDlProgress(env) {
   }
 }
 
+// 查询远端文件大小：>=0 表示存在（-1 表示存在但拿不到大小），-2 表示确认不存在。
+// 部分 WebDAV 服务端（如 AList/OneDrive 中转）在上传成功后仍可能返回 5xx 或直接断开连接，
+// 因此不能只看 PUT 的状态码，必须回查远端文件来判定是否真的失败。
+async function webdavRemoteSize(base, folder, filename, auth) {
+  var url = base + '/' + folder + '/' + filename;
+  var authHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA };
+  try {
+    var r = await fetch(url, { method: 'PROPFIND', headers: Object.assign({ 'Depth': '0' }, authHeaders) });
+    if (r.status === 207 || (r.status >= 200 && r.status < 300)) {
+      var text = '';
+      try { text = await r.text(); } catch (e) {}
+      var m = text.match(/getcontentlength[^>]*>\s*(\d+)\s*</i);
+      if (m) return Number(m[1]);
+      return -1;
+    }
+  } catch (e1) {}
+  try {
+    var h = await fetch(url, { method: 'HEAD', headers: authHeaders });
+    if (h.status >= 200 && h.status < 300) {
+      var len = h.headers.get('content-length');
+      return len === null || len === '' ? -1 : Number(len);
+    }
+  } catch (e2) {}
+  try {
+    var g = await fetch(url, { method: 'GET', headers: Object.assign({ 'Range': 'bytes=0-0' }, authHeaders) });
+    if (g.status === 206 || (g.status >= 200 && g.status < 300)) {
+      var cr = g.headers.get('content-range') || '';
+      var cm = cr.match(/\/(\d+)/);
+      if (cm) return Number(cm[1]);
+      var cl = g.headers.get('content-length');
+      return cl === null || cl === '' ? -1 : Number(cl);
+    }
+  } catch (e3) {}
+  return -2;
+}
+
+function sleepMs(ms) {
+  return new Promise(function (resolve) {
+    try { setTimeout(resolve, ms); } catch (e) { resolve(); }
+  });
+}
+
+// 上传结果确认：存在且大小与下载内容一致（或无法获取大小时按存在处理）才认为上传成功。
+async function confirmWebdavUpload(base, folder, filename, auth, expectedSize) {
+  for (var attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await sleepMs(1500);
+    var remoteSize = await webdavRemoteSize(base, folder, filename, auth);
+    if (remoteSize === -2) continue;
+    if (remoteSize > 0 && expectedSize > 0) {
+      if (Math.abs(remoteSize - expectedSize) <= 1024) return { ok: true, size: remoteSize };
+      continue;
+    }
+    return { ok: true, size: remoteSize };
+  }
+  return { ok: false };
+}
+
 async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   if (!settings.webdavUrl) throw new Error('未配置 WebDAV 地址');
   var videoUrl = 'https://www.bilibili.com/video/' + bvid;
@@ -764,62 +824,71 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var dest = base + '/' + folder + '/' + filename;
   var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream' };
   var upload;
-  // 目标文件已存在视为上传成功：避免上次上传实际已写入但状态码异常时被反复重下重传。
-  if (await webdavFileExists(base, folder, filename, auth)) {
+  var expectedSize = Number(download.headers.get('content-length') || 0);
+  var uploadThrew = '';
+  // 目标文件已存在且大小一致视为上传成功：避免上次上传实际已写入但状态码异常时被反复重下重传。
+  var preSize = await webdavRemoteSize(base, folder, filename, auth);
+  var preDone = preSize !== -2 && (expectedSize <= 0 || preSize <= 0 || Math.abs(preSize - expectedSize) <= 1024);
+  if (preDone) {
     if (manual) await writeDlProgress(env, { stage: 'done', message: '文件已存在，跳过上传', percent: 100 });
     await addLog(env, 'info', '[' + (up.name || up.mid) + '] 目标文件已存在，跳上传：' + folderName + '/' + fileBaseName);
     upload = { status: 200 };
-  } else if (manual && typeof download.body.tee === 'function') {
-    var branches = download.body.tee();
-    var uploadStream = branches[0];
-    var progressStream = branches[1];
-    var total = Number(download.headers.get('content-length') || 0);
-    var progressPromise = (async function () {
-      var reader = progressStream.getReader();
-      var downloaded = 0;
-      var last = 0;
-      while (true) {
-        var part = await reader.read();
-        if (part.done) break;
-        downloaded += part.value.byteLength || part.value.length || 0;
-        if (Date.now() - last > 1000) {
-          last = Date.now();
-          var pct = total ? Math.min(99, Math.round((downloaded / total) * 85) + 10) : null;
-          await writeDlProgress(env, { stage: 'download', message: '下载中...', bytes: downloaded, total: total, percent: pct });
-        }
-      }
-      await writeDlProgress(env, { stage: 'upload', message: '上传中...', bytes: downloaded, total: total, percent: total ? 90 : null });
-    })();
-    upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: uploadStream });
-    await progressPromise;
   } else {
-    if (manual) await writeDlProgress(env, { stage: 'upload', message: '上传中...', percent: null });
-    upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: download.body });
-  }
-  if (upload.status === 405) {
-    var verifyOk = false;
     try {
-      var checkHead = await fetch(dest, { method: 'HEAD', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA } });
-      if (checkHead.status >= 200 && checkHead.status < 300) verifyOk = true;
-    } catch (e2) {}
-    if (!verifyOk) {
-      try {
-        var checkProp = await fetch(dest, { method: 'PROPFIND', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Depth': '0' } });
-        if (checkProp.status >= 200 && checkProp.status < 300) verifyOk = true;
-      } catch (e3) {}
+      if (manual && typeof download.body.tee === 'function') {
+        var branches = download.body.tee();
+        var uploadStream = branches[0];
+        var progressStream = branches[1];
+        var total = expectedSize;
+        var progressPromise = (async function () {
+          var reader = progressStream.getReader();
+          var downloaded = 0;
+          var last = 0;
+          while (true) {
+            var part = await reader.read();
+            if (part.done) break;
+            downloaded += part.value.byteLength || part.value.length || 0;
+            if (Date.now() - last > 1000) {
+              last = Date.now();
+              var pct = total ? Math.min(99, Math.round((downloaded / total) * 85) + 10) : null;
+              await writeDlProgress(env, { stage: 'download', message: '下载中...', bytes: downloaded, total: total, percent: pct });
+            }
+          }
+          await writeDlProgress(env, { stage: 'upload', message: '上传中...', bytes: downloaded, total: total, percent: total ? 90 : null });
+        })();
+        upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: uploadStream });
+        await progressPromise;
+      } else {
+        if (manual) await writeDlProgress(env, { stage: 'upload', message: '上传中...', percent: null });
+        upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: download.body });
+      }
+    } catch (e) {
+      // 长视频上传容易被中间层超时掐断连接，此时服务端可能已经写入完成，不能直接判定失败。
+      uploadThrew = String(e && e.message || e);
+      upload = null;
     }
-    if (verifyOk) upload = { status: 207 };
   }
-  if (upload.status < 200 || upload.status >= 300) {
+  var uploadOk = !!(upload && upload.status >= 200 && upload.status < 300);
+  if (!uploadOk) {
+    var uploadStatus = upload ? upload.status : 0;
+    // 状态码异常（405/5xx）或连接中断时，回查远端文件确认是否其实已写入成功。
+    var confirm = await confirmWebdavUpload(base, folder, filename, auth, expectedSize);
+    if (confirm.ok) {
+      uploadOk = true;
+      await addLog(env, 'info', '[' + (up.name || up.mid) + '] WebDAV 返回异常（' + (uploadThrew || ('HTTP ' + uploadStatus)) + '），但远端文件已确认写入，按成功处理：' + folderName + '/' + fileBaseName);
+    }
+  }
+  if (!uploadOk) {
+    var uploadStatus2 = upload ? upload.status : 0;
     if (folderFromIndex) {
       await deleteUpFolderIndex(env, up.mid);
       await addLog(env, 'error', '[' + (up.name || up.mid) + '] 索引中的UP主文件夹已失效，已清除索引，下次将重新探测：' + folderName);
     }
     // 405 通常是目标目录不存在或服务端拒绝写入，先补建目录，下一轮重试时可直接成功。
-    if (upload.status === 405 || upload.status === 409) {
+    if (uploadStatus2 === 405 || uploadStatus2 === 409) {
       await ensureWebdavFolder(base, folder, auth);
     }
-    var uploadErr = 'WebDAV 上传失败 HTTP ' + upload.status;
+    var uploadErr = uploadThrew ? ('WebDAV 上传失败：' + uploadThrew) : ('WebDAV 上传失败 HTTP ' + uploadStatus2);
     if (manual) await writeDlProgress(env, { stage: 'error', message: uploadErr, percent: 0 });
     var err = new Error(uploadErr);
     err.stage = 'upload';
@@ -1354,12 +1423,24 @@ async function parseAndUploadVideo(settings, link, env) {
   var dest = base + '/' + folder + '/' + filename;
   var videoResp = await fetch(data.durl[0].url, { headers: { 'User-Agent': UA, 'Referer': 'https://www.bilibili.com/' }, redirect: 'follow' });
   if (!videoResp.ok) return { ok: false, error: '视频下载失败 HTTP ' + videoResp.status };
-  var uploadResp = await fetch(dest, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' }, body: videoResp.body });
-  var uploadOk = uploadResp.status >= 200 && uploadResp.status < 300;
-  if (!uploadOk && (uploadResp.status === 405 || uploadResp.status === 409)) {
-    uploadOk = await webdavFileExists(base, folder, filename, auth);
+  var uploadResp = null;
+  var uploadThrew = '';
+  try {
+    uploadResp = await fetch(dest, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' }, body: videoResp.body });
+  } catch (e) {
+    uploadThrew = String(e && e.message || e);
   }
-  if (!uploadOk) return { ok: false, title: title, bvid: bvid, folder: folderRaw, error: 'WebDAV上传失败 HTTP ' + uploadResp.status };
+  var expectedSize = Number(videoResp.headers.get('content-length') || 0);
+  var uploadOk = !!(uploadResp && uploadResp.status >= 200 && uploadResp.status < 300);
+  if (!uploadOk) {
+    // 与监控流程一致：状态码异常/连接中断时回查远端文件，避免已写入却报失败。
+    var confirm = await confirmWebdavUpload(base, folder, filename, auth, expectedSize);
+    uploadOk = confirm.ok;
+  }
+  if (!uploadOk) {
+    var errText = uploadThrew ? ('WebDAV上传失败：' + uploadThrew) : ('WebDAV上传失败 HTTP ' + (uploadResp ? uploadResp.status : 0));
+    return { ok: false, title: title, bvid: bvid, folder: folderRaw, error: errText };
+  }
   await addLog(env, 'info', '解析下载成功：' + title + ' -> ' + folderRaw);
   return { ok: true, title: title, bvid: bvid, folder: folderRaw };
 }
