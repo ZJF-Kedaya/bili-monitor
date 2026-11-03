@@ -725,8 +725,8 @@ async function readDlProgress(env) {
 }
 
 // 查询远端文件大小：>=0 表示存在（-1 表示存在但拿不到大小），-2 表示确认不存在。
-// 部分 WebDAV 服务端（如 AList/OneDrive 中转）在上传成功后仍可能返回 5xx 或直接断开连接，
-// 因此不能只看 PUT 的状态码，必须回查远端文件来判定是否真的失败。
+// OpenList/AList 等服务端上传返回的状态码不可信，且文件列表有缓存延迟，
+// 因此不能只看 PUT 的状态码，必须轮询回查远端文件来判定是否真的失败。
 async function webdavRemoteSize(base, folder, filename, auth) {
   var url = base + '/' + folder + '/' + filename;
   var authHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA };
@@ -766,15 +766,24 @@ function sleepMs(ms) {
   });
 }
 
-// 上传结果确认：存在且大小与下载内容一致（或无法获取大小时按存在处理）才认为上传成功。
-async function confirmWebdavUpload(base, folder, filename, auth, expectedSize) {
-  for (var attempt = 0; attempt < 2; attempt++) {
-    if (attempt > 0) await sleepMs(1500);
+// 上传结果确认：在 maxWaitMs 时间窗内轮询远端，等文件真正出现（且大小一致）才算成功。
+// OpenList/AList 的目录列表有缓存延迟，上传后立即查可能查不到，必须持续轮询。
+async function pollWebdavUpload(base, folder, filename, auth, expectedSize, maxWaitMs) {
+  var deadline = Date.now() + (maxWaitMs || 20000);
+  var interval = 2500;
+  var first = true;
+  while (true) {
+    if (!first) {
+      if (Date.now() >= deadline) break;
+      await sleepMs(Math.min(interval, Math.max(0, deadline - Date.now())));
+    }
+    first = false;
     var remoteSize = await webdavRemoteSize(base, folder, filename, auth);
     if (remoteSize === -2) continue;
     if (remoteSize > 0 && expectedSize > 0) {
-      if (Math.abs(remoteSize - expectedSize) <= 1024) return { ok: true, size: remoteSize };
-      continue;
+      // 大小不符可能是写入中或旧的部分文件，继续等到窗口结束；结束后仍不符按失败处理。
+      if (Math.abs(remoteSize - expectedSize) > 1024 && Date.now() < deadline) continue;
+      return { ok: Math.abs(remoteSize - expectedSize) <= 1024, size: remoteSize };
     }
     return { ok: true, size: remoteSize };
   }
@@ -825,15 +834,33 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream' };
   var upload;
   var expectedSize = Number(download.headers.get('content-length') || 0);
-  var uploadThrew = '';
+  var uploadOk = false;
+  var lastErrText = '';
   // 目标文件已存在且大小一致视为上传成功：避免上次上传实际已写入但状态码异常时被反复重下重传。
   var preSize = await webdavRemoteSize(base, folder, filename, auth);
   var preDone = preSize !== -2 && (expectedSize <= 0 || preSize <= 0 || Math.abs(preSize - expectedSize) <= 1024);
   if (preDone) {
     if (manual) await writeDlProgress(env, { stage: 'done', message: '文件已存在，跳过上传', percent: 100 });
     await addLog(env, 'info', '[' + (up.name || up.mid) + '] 目标文件已存在，跳上传：' + folderName + '/' + fileBaseName);
-    upload = { status: 200 };
-  } else {
+    uploadOk = true;
+  }
+  // OpenList/AList 上传返回的状态码不可信（可能文件已写入却返回异常码），
+  // 且目录列表有缓存延迟（刚上传完立刻查可能查不到）。
+  // 因此判定流程：PUT 返回 2xx 即成功；否则轮询等待文件出现（最长 30 秒）；
+  // 仍确认不到则重传一次（PUT 幂等，覆盖写），再轮询 15 秒，只有两轮都确认不到才判定失败。
+  for (var attemptNo = 1; attemptNo <= 2 && !uploadOk; attemptNo++) {
+    if (attemptNo > 1) {
+      // 上一次的下载流已被消费，重传需要重新走一遍下载接口。
+      if (manual) await writeDlProgress(env, { stage: 'start', message: '重新下载并重试上传...', percent: 1 });
+      download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA } });
+      if (!download.ok || !download.body) {
+        lastErrText = '重试下载接口失败 HTTP ' + download.status;
+        break;
+      }
+      expectedSize = Number(download.headers.get('content-length') || 0);
+    }
+    var uploadStatus = 0;
+    var uploadThrew = '';
     try {
       if (manual && typeof download.body.tee === 'function') {
         var branches = download.body.tee();
@@ -867,30 +894,31 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
       uploadThrew = String(e && e.message || e);
       upload = null;
     }
-  }
-  var uploadOk = !!(upload && upload.status >= 200 && upload.status < 300);
-  if (!uploadOk) {
-    var uploadStatus = upload ? upload.status : 0;
-    // 状态码异常（405/5xx）或连接中断时，回查远端文件确认是否其实已写入成功。
-    var confirm = await confirmWebdavUpload(base, folder, filename, auth, expectedSize);
-    if (confirm.ok) {
+    uploadStatus = upload ? upload.status : 0;
+    if (upload && uploadStatus >= 200 && uploadStatus < 300) {
+      uploadOk = true;
+      break;
+    }
+    var pollRes = await pollWebdavUpload(base, folder, filename, auth, expectedSize, attemptNo === 1 ? 30000 : 15000);
+    if (pollRes.ok) {
       uploadOk = true;
       await addLog(env, 'info', '[' + (up.name || up.mid) + '] WebDAV 返回异常（' + (uploadThrew || ('HTTP ' + uploadStatus)) + '），但远端文件已确认写入，按成功处理：' + folderName + '/' + fileBaseName);
+      break;
     }
-  }
-  if (!uploadOk) {
-    var uploadStatus2 = upload ? upload.status : 0;
-    if (folderFromIndex) {
+    lastErrText = uploadThrew ? ('WebDAV 上传失败：' + uploadThrew) : ('WebDAV 上传失败 HTTP ' + uploadStatus);
+    if (attemptNo >= 2) break;
+    // 准备重传：405/409 通常是目录不存在或拒绝写入，先补建目录；索引失效则清除索引。
+    if (folderFromIndex && (uploadStatus === 405 || uploadStatus === 409)) {
       await deleteUpFolderIndex(env, up.mid);
       await addLog(env, 'error', '[' + (up.name || up.mid) + '] 索引中的UP主文件夹已失效，已清除索引，下次将重新探测：' + folderName);
+      folderFromIndex = false;
     }
-    // 405 通常是目标目录不存在或服务端拒绝写入，先补建目录，下一轮重试时可直接成功。
-    if (uploadStatus2 === 405 || uploadStatus2 === 409) {
-      await ensureWebdavFolder(base, folder, auth);
-    }
-    var uploadErr = uploadThrew ? ('WebDAV 上传失败：' + uploadThrew) : ('WebDAV 上传失败 HTTP ' + uploadStatus2);
-    if (manual) await writeDlProgress(env, { stage: 'error', message: uploadErr, percent: 0 });
-    var err = new Error(uploadErr);
+    await ensureWebdavFolder(base, folder, auth);
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] 首次上传未确认成功（' + (uploadThrew || ('HTTP ' + uploadStatus)) + '），正在重试：' + folderName + '/' + fileBaseName);
+  }
+  if (!uploadOk) {
+    if (manual) await writeDlProgress(env, { stage: 'error', message: lastErrText || 'WebDAV 上传失败', percent: 0 });
+    var err = new Error(lastErrText || 'WebDAV 上传失败');
     err.stage = 'upload';
     throw err;
   }
@@ -1433,8 +1461,9 @@ async function parseAndUploadVideo(settings, link, env) {
   var expectedSize = Number(videoResp.headers.get('content-length') || 0);
   var uploadOk = !!(uploadResp && uploadResp.status >= 200 && uploadResp.status < 300);
   if (!uploadOk) {
-    // 与监控流程一致：状态码异常/连接中断时回查远端文件，避免已写入却报失败。
-    var confirm = await confirmWebdavUpload(base, folder, filename, auth, expectedSize);
+    // 与监控流程一致：OpenList 状态码不可信且目录列表有缓存延迟，
+    // 状态码异常/连接中断时轮询等待远端文件出现，避免已写入却报失败。
+    var confirm = await pollWebdavUpload(base, folder, filename, auth, expectedSize, 30000);
     uploadOk = confirm.ok;
   }
   if (!uploadOk) {
