@@ -766,18 +766,68 @@ function sleepMs(ms) {
   });
 }
 
+// 统计实际发往 WebDAV 的字节数，并保留末尾若干字节用于内容抽查。
+// 这是区分“确定中断（字节没发完）”与“疑似中断（字节发完了但响应阶段断开）”的关键依据。
+function makeCountingUploadStream(source, state, tailLen) {
+  var tailKeep = tailLen || 1024;
+  var tail = null;
+  var ts = new TransformStream({
+    transform: function (chunk, controller) {
+      var bytes = chunk && (chunk.byteLength || chunk.length) || 0;
+      state.sent += bytes;
+      if (tailKeep > 0 && bytes > 0) {
+        var u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        if (!tail) {
+          tail = u8.length > tailKeep ? u8.slice(u8.length - tailKeep) : u8.slice(0);
+        } else {
+          var merged = new Uint8Array(tail.length + u8.length);
+          merged.set(tail, 0);
+          merged.set(u8, tail.length);
+          tail = merged.length > tailKeep ? merged.slice(merged.length - tailKeep) : merged;
+        }
+        state.tail = tail;
+      }
+      controller.enqueue(chunk);
+    }
+  });
+  return source.pipeThrough(ts);
+}
+
+// 抽查远端文件末尾内容是否与本地一致：true 一致 / false 明确不一致 / null 无法验证（不作为失败依据）。
+async function webdavTailMatches(base, folder, filename, auth, remoteSize, tail) {
+  try {
+    if (!tail || !tail.length || !(remoteSize > 0)) return null;
+    var url = base + '/' + folder + '/' + filename;
+    var start = Math.max(0, remoteSize - tail.length);
+    var r = await fetch(url, { method: 'GET', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Range': 'bytes=' + start + '-' + (remoteSize - 1) } });
+    if (r.status !== 206 && !(r.status >= 200 && r.status < 300)) return null;
+    var buf = new Uint8Array(await r.arrayBuffer());
+    if (buf.length === tail.length + start && r.status === 200) {
+      // 服务器不支持 Range 返回了整个文件，取末尾比对
+      buf = buf.subarray(buf.length - tail.length);
+    } else if (buf.length !== tail.length) {
+      return null;
+    }
+    for (var i = 0; i < tail.length; i++) {
+      if (buf[i] !== tail[i]) return false;
+    }
+    return true;
+  } catch (e) {
+    return null;
+  }
+}
+
 // 上传结果确认（仅用于连接中断等异常场景）：远端存在且大小与下载内容一致（或无法获取大小时按存在处理）才认为上传成功。
-// OpenList 等服务文件列表有延迟，因此分多次、带间隔重试。
-async function confirmWebdavUpload(base, folder, filename, auth, expectedSize) {
+// OpenList 等服务文件列表有延迟，因此分多次、带间隔重试；大小一致时抽查末尾内容。
+async function confirmWebdavUpload(base, folder, filename, auth, expectedSize, upState) {
   var delays = [0, 1500, 4000];
   for (var attempt = 0; attempt < delays.length; attempt++) {
     if (delays[attempt] > 0) await sleepMs(delays[attempt]);
     var remoteSize = await webdavRemoteSize(base, folder, filename, auth);
     if (remoteSize === -2) continue;
-    if (remoteSize > 0 && expectedSize > 0) {
-      if (Math.abs(remoteSize - expectedSize) <= 1024) return { ok: true, size: remoteSize };
-      continue;
-    }
+    if (remoteSize > 0 && expectedSize > 0 && Math.abs(remoteSize - expectedSize) > 1024) continue;
+    var tailVerdict = await webdavTailMatches(base, folder, filename, auth, remoteSize, upState && upState.tail);
+    if (tailVerdict === false) continue;
     return { ok: true, size: remoteSize };
   }
   return { ok: false };
@@ -836,10 +886,11 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
     await addLog(env, 'info', '[' + (up.name || up.mid) + '] 目标文件已存在，跳上传：' + folderName + '/' + fileBaseName);
     upload = { status: 200 };
   } else {
+    var upState = { sent: 0, tail: null };
     try {
       if (manual && typeof download.body.tee === 'function') {
         var branches = download.body.tee();
-        var uploadStream = branches[0];
+        var uploadStream = makeCountingUploadStream(branches[0], upState, 1024);
         var progressStream = branches[1];
         var total = expectedSize;
         var progressPromise = (async function () {
@@ -862,7 +913,8 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
         await progressPromise;
       } else {
         if (manual) await writeDlProgress(env, { stage: 'upload', message: '上传中...', percent: null });
-        upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: download.body });
+        var countedStream = makeCountingUploadStream(download.body, upState, 1024);
+        upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: countedStream });
       }
     } catch (e) {
       // 长视频上传容易被中间层超时掐断连接，此时服务端可能已经写入完成，不能直接判定失败。
@@ -879,11 +931,19 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
       await addLog(env, 'info', '[' + (up.name || up.mid) + '] WebDAV 返回 HTTP ' + upload.status + '（OpenList 等服务状态码不可靠，按成功处理）：' + folderName + '/' + fileBaseName);
     }
   } else {
-    // 请求本身没完成（连不上 WebDAV 或上传中断）：回查远端文件几次，查到了仍按成功处理。
-    var confirm = await confirmWebdavUpload(base, folder, filename, auth, expectedSize);
-    uploadOk = confirm.ok;
-    if (uploadOk) {
+    // 请求本身没完成（连不上 WebDAV 或上传中断）：
+    // 先回查远端文件（带列表延迟重试与尾部内容抽查），查到了仍按成功处理；
+    // 查不到时若本地字节已全部发出，说明数据完整送达、只是响应阶段断开，同样按成功处理；
+    // 只有字节数明显没发完（确定中断）或完全连不上，才判定失败。
+    var confirm = await confirmWebdavUpload(base, folder, filename, auth, expectedSize, upState);
+    if (confirm.ok) {
+      uploadOk = true;
       await addLog(env, 'info', '[' + (up.name || up.mid) + '] 上传连接中断，但远端文件已确认写入，按成功处理：' + folderName + '/' + fileBaseName);
+    } else if (expectedSize > 0 && upState.sent >= expectedSize - 1024) {
+      uploadOk = true;
+      await addLog(env, 'info', '[' + (up.name || up.mid) + '] 上传响应中断，但数据已完整发出（' + upState.sent + ' 字节），按成功处理：' + folderName + '/' + fileBaseName);
+    } else {
+      uploadOk = false;
     }
   }
   if (!uploadOk) {
@@ -1411,8 +1471,10 @@ async function parseAndUploadVideo(settings, link, env) {
   if (!videoResp.ok) return { ok: false, error: '视频下载失败 HTTP ' + videoResp.status };
   var uploadResp = null;
   var uploadThrew = '';
+  var upState = { sent: 0, tail: null };
   try {
-    uploadResp = await fetch(dest, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' }, body: videoResp.body });
+    var countedBody = videoResp.body ? makeCountingUploadStream(videoResp.body, upState, 1024) : videoResp.body;
+    uploadResp = await fetch(dest, { method: 'PUT', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream', 'Overwrite': 'T' }, body: countedBody });
   } catch (e) {
     uploadThrew = String(e && e.message || e);
   }
@@ -1422,8 +1484,8 @@ async function parseAndUploadVideo(settings, link, env) {
     // 与监控流程一致：只要有响应就按成功处理，OpenList 等服务的状态码不可靠。
     uploadOk = true;
   } else {
-    var confirm = await confirmWebdavUpload(base, folder, filename, auth, expectedSize);
-    uploadOk = confirm.ok;
+    var confirm = await confirmWebdavUpload(base, folder, filename, auth, expectedSize, upState);
+    uploadOk = confirm.ok || (expectedSize > 0 && upState.sent >= expectedSize - 1024);
   }
   if (!uploadOk) {
     var errText = uploadThrew ? ('WebDAV上传失败（连接中断或上传未完成）：' + uploadThrew) : 'WebDAV上传失败（连接中断或上传未完成）';
