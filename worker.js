@@ -841,6 +841,14 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   var download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA } });
   if (!download.ok) throw new Error('下载接口 HTTP ' + download.status);
   if (!download.body) throw new Error('下载接口未返回内容');
+  // 下载接口失败时经常返回 HTTP 200 + JSON/HTML 错误页，而不是视频流。
+  // 不校验的话会把错误页当成 mp4 传上去，表现为“没下载成功但也没报失败”。
+  var dlType = String(download.headers.get('content-type') || '').toLowerCase();
+  if (/json|html|xml|text\/plain/.test(dlType)) {
+    var errPreview = '';
+    try { errPreview = String(await download.text()).slice(0, 300); } catch (e0) {}
+    throw new Error('下载接口未返回视频（Content-Type: ' + dlType + '）：' + truncate(errPreview, 200));
+  }
   var base = String(settings.webdavUrl).replace(/\/+$/, '');
   var logUser = settings.logWebdavUser || settings.webdavUser || '';
   var logPass = settings.logWebdavPass || settings.webdavPass || '';
@@ -958,6 +966,21 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
     var err = new Error(uploadErr);
     err.stage = 'upload';
     throw err;
+  }
+  // 下载流提前结束（实际发出的字节明显少于期望大小）→ 上传的是截断视频，视为失败并清理残留文件。
+  if (upState && upState.sent === 0) {
+    try { await fetch(dest, { method: 'DELETE', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA } }); } catch (e5) {}
+    var emptyErr = new Error('下载接口未返回任何视频数据（0 字节）');
+    emptyErr.stage = 'download';
+    if (manual) await writeDlProgress(env, { stage: 'error', message: emptyErr.message, percent: 0 });
+    throw emptyErr;
+  }
+  if (upState && expectedSize > 0 && upState.sent > 0 && upState.sent < expectedSize - 1024) {
+    try { await fetch(dest, { method: 'DELETE', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA } }); } catch (e6) {}
+    var truncErr = new Error('下载流提前结束：实际 ' + upState.sent + ' / 期望 ' + expectedSize + ' 字节，视频不完整');
+    truncErr.stage = 'download';
+    if (manual) await writeDlProgress(env, { stage: 'error', message: truncErr.message, percent: 0 });
+    throw truncErr;
   }
   if (manual) await writeDlProgress(env, { stage: 'done', message: '上传完成', percent: 100 });
   await addLog(env, 'info', '[' + (up.name || up.mid) + '] 已上传：' + folderName + '/' + fileBaseName);
@@ -1082,7 +1105,7 @@ async function handleVideo(item, up, settings, env, handled, persist) {
   }
   if (needNotify && !notifyDone) {
     var didNotify = await performOnce(entry, 'notifyDone', 'notifyTried', function () {
-      return sendWeCom(settings.wecomWebhook, '新视频', author, title, url, env, uploadError ? ['<font color="warning">该视频上传失败</font>'] : null);
+      return sendWeCom(settings.wecomWebhook, '新视频', author, title, url, env, uploadError ? ['<font color="warning">该视频上传失败</font>', '失败原因：' + truncate(uploadError, 150)] : null);
     });
     if (didNotify) markHandled(persist, bvid, 'n');
   }
@@ -1119,7 +1142,7 @@ async function handleDynamic(item, up, settings, env, handled, persist) {
   }
   if (needNotify && !notifyDone) {
     var didNotify = await performOnce(entry, 'notifyDone', 'notifyTried', function () {
-      return sendWeCom(settings.wecomWebhook, '新动态', info.author || up.name || up.mid, text, url, env, uploadError ? ['<font color="warning">该视频上传失败</font>'] : null);
+      return sendWeCom(settings.wecomWebhook, '新动态', info.author || up.name || up.mid, text, url, env, uploadError ? ['<font color="warning">该视频上传失败</font>', '失败原因：' + truncate(uploadError, 150)] : null);
     });
     if (didNotify) markHandled(persist, bvid, 'n');
   }
@@ -1469,6 +1492,12 @@ async function parseAndUploadVideo(settings, link, env) {
   var dest = base + '/' + folder + '/' + filename;
   var videoResp = await fetch(data.durl[0].url, { headers: { 'User-Agent': UA, 'Referer': 'https://www.bilibili.com/' }, redirect: 'follow' });
   if (!videoResp.ok) return { ok: false, error: '视频下载失败 HTTP ' + videoResp.status };
+  var vType = String(videoResp.headers.get('content-type') || '').toLowerCase();
+  if (/json|html|xml|text\/plain/.test(vType)) {
+    var vPreview = '';
+    try { vPreview = String(await videoResp.text()).slice(0, 200); } catch (eV) {}
+    return { ok: false, error: '下载接口未返回视频（Content-Type: ' + vType + '）：' + truncate(vPreview, 150) };
+  }
   var uploadResp = null;
   var uploadThrew = '';
   var upState = { sent: 0, tail: null };
