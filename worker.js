@@ -833,21 +833,43 @@ async function confirmWebdavUpload(base, folder, filename, auth, expectedSize, u
   return { ok: false };
 }
 
+// 外层包装：下载接口偶发抽风（HTTP 5xx/567 等）或 WebDAV PUT 返回 404（目录丢失）时自动重试一次。
 async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
+  try {
+    return await downloadAndUploadOnce(settings, up, bvid, title, env, manual, false);
+  } catch (e) {
+    if (!e || e.noRetry || (e.stage !== 'download' && e.stage !== 'upload404')) throw e;
+    await addLog(env, 'info', '[' + (up.name || up.mid) + '] ' + String(e && e.message || e) + '，5 秒后自动重试一次');
+    await sleepMs(5000);
+    return await downloadAndUploadOnce(settings, up, bvid, title, env, manual, true);
+  }
+}
+
+async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, retried) {
   if (!settings.webdavUrl) throw new Error('未配置 WebDAV 地址');
   var videoUrl = 'https://www.bilibili.com/video/' + bvid;
   var apiUrl = settings.downloadApi + encodeURIComponent(videoUrl);
   if (manual) await writeDlProgress(env, { stage: 'start', message: '准备下载...', percent: 1 });
   var download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA } });
-  if (!download.ok) throw new Error('下载接口 HTTP ' + download.status);
-  if (!download.body) throw new Error('下载接口未返回内容');
+  if (!download.ok) {
+    var httpErr = new Error('下载接口 HTTP ' + download.status);
+    httpErr.stage = 'download';
+    throw httpErr;
+  }
+  if (!download.body) {
+    var noBodyErr = new Error('下载接口未返回内容');
+    noBodyErr.stage = 'download';
+    throw noBodyErr;
+  }
   // 下载接口失败时经常返回 HTTP 200 + JSON/HTML 错误页，而不是视频流。
   // 不校验的话会把错误页当成 mp4 传上去，表现为“没下载成功但也没报失败”。
   var dlType = String(download.headers.get('content-type') || '').toLowerCase();
   if (/json|html|xml|text\/plain/.test(dlType)) {
     var errPreview = '';
     try { errPreview = String(await download.text()).slice(0, 300); } catch (e0) {}
-    throw new Error('下载接口未返回视频（Content-Type: ' + dlType + '）：' + truncate(errPreview, 200));
+    var typeErr = new Error('下载接口未返回视频（Content-Type: ' + dlType + '）：' + truncate(errPreview, 200));
+    typeErr.stage = 'download';
+    throw typeErr;
   }
   var base = String(settings.webdavUrl).replace(/\/+$/, '');
   var logUser = settings.logWebdavUser || settings.webdavUser || '';
@@ -932,11 +954,29 @@ async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
   }
   var uploadOk;
   if (upload) {
-    // 只要服务端返回了响应（无论状态码），一律按上传成功处理。
-    // OpenList 等 WebDAV 服务的上传状态码不可靠（经常 5xx/405 但文件已写入），不能作为失败依据。
-    uploadOk = true;
-    if (upload.status < 200 || upload.status >= 300) {
-      await addLog(env, 'info', '[' + (up.name || up.mid) + '] WebDAV 返回 HTTP ' + upload.status + '（OpenList 等服务状态码不可靠，按成功处理）：' + folderName + '/' + fileBaseName);
+    // OpenList 等 WebDAV 服务的上传状态码不可靠（经常 5xx/405 但文件已写入），一律按成功处理；
+    // 唯一例外是 404：它通常意味着目标目录/路径不存在，文件几乎不可能写进去，必须回查确认。
+    if (upload.status === 404) {
+      var confirm404 = await confirmWebdavUpload(base, folder, filename, auth, expectedSize, upState);
+      if (confirm404.ok) {
+        uploadOk = true;
+        await addLog(env, 'info', '[' + (up.name || up.mid) + '] WebDAV 返回 HTTP 404，但远端文件已确认写入，按成功处理：' + folderName + '/' + fileBaseName);
+      } else {
+        if (folderFromIndex) {
+          await deleteUpFolderIndex(env, up.mid);
+          await addLog(env, 'error', '[' + (up.name || up.mid) + '] 索引中的UP主文件夹已失效，已清除索引，下次将重新探测：' + folderName);
+        }
+        await ensureWebdavFolder(base, folder, auth);
+        var err404 = new Error('WebDAV 上传返回 HTTP 404（目标目录不存在或路径无效），文件未写入');
+        err404.stage = 'upload404';
+        if (manual) await writeDlProgress(env, { stage: 'error', message: err404.message, percent: 0 });
+        throw err404;
+      }
+    } else {
+      uploadOk = true;
+      if (upload.status < 200 || upload.status >= 300) {
+        await addLog(env, 'info', '[' + (up.name || up.mid) + '] WebDAV 返回 HTTP ' + upload.status + '（OpenList 等服务状态码不可靠，按成功处理）：' + folderName + '/' + fileBaseName);
+      }
     }
   } else {
     // 请求本身没完成（连不上 WebDAV 或上传中断）：
@@ -1357,7 +1397,24 @@ async function overview(env) {
   }
   return { latest: latest };
 }
+// 并发保护：一轮检查（含大视频下载上传）可能耗时数分钟，若下一轮在上一轮保存 lastSeen 之前开始，
+// 会读到旧状态，导致同一视频被重复通知、重复下载。用状态锁跳过重叠的一轮。
 async function checkAll(env) {
+  var lockAt = 0;
+  try { lockAt = Number(await stateGet(env, 'checkLock', 0)) || 0; } catch (eL) {}
+  if (lockAt && Date.now() - lockAt < 15 * 60000) {
+    await addLog(env, 'info', '上一轮检查仍在进行中，本轮跳过，防止重复通知/下载');
+    return { videos: [], dynamics: [], errors: [], skipped: true };
+  }
+  try { await statePut(env, 'checkLock', Date.now()); } catch (eL2) {}
+  try {
+    return await checkAllInner(env);
+  } finally {
+    try { await statePut(env, 'checkLock', 0); } catch (eL3) {}
+  }
+}
+
+async function checkAllInner(env) {
   const settings = await getSettings(env);
   if (env.BILI_MONITOR_D1 && !preferredRsshubBase) {
     try {
