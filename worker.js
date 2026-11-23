@@ -18,6 +18,11 @@ const DEFAULT_SETTINGS = {
   webdavDefaultFolder: '默认',
   logWebdavUrl: '',
   successLogWebdavUrl: '',
+  // 单个视频“下载+上传”总耗时上限（分钟）。Cloudflare Worker 定时触发有运行时长限制（付费 15 分钟），
+  // 下载接口太慢时很容易被平台掐断，与其被莫名中止，不如到点明确失败并提示。
+  maxStreamMinutes: 12,
+  // 单个视频大小上限（MB），0 = 不限制。超过则跳过下载并在通知中说明，避免慢速接口长时间占用。
+  maxDownloadMB: 0,
   ups: []
 };
 
@@ -768,11 +773,15 @@ function sleepMs(ms) {
 
 // 统计实际发往 WebDAV 的字节数，并保留末尾若干字节用于内容抽查。
 // 这是区分“确定中断（字节没发完）”与“疑似中断（字节发完了但响应阶段断开）”的关键依据。
-function makeCountingUploadStream(source, state, tailLen) {
+function makeCountingUploadStream(source, state, tailLen, deadlineMs) {
   var tailKeep = tailLen || 1024;
   var tail = null;
   var ts = new TransformStream({
     transform: function (chunk, controller) {
+      if (deadlineMs && Date.now() > deadlineMs) {
+        state.deadlineHit = true;
+        throw new Error('stream deadline exceeded');
+      }
       var bytes = chunk && (chunk.byteLength || chunk.length) || 0;
       state.sent += bytes;
       if (tailKeep > 0 && bytes > 0) {
@@ -871,6 +880,18 @@ async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, ret
     typeErr.stage = 'download';
     throw typeErr;
   }
+  var expectedSize = Number(download.headers.get('content-length') || 0);
+  // 超大视频跳过：慢速下载会长时间占用 Worker 运行时长（平台有限制），还会拖住其他 UP 的检查。
+  var maxMB = Number(settings.maxDownloadMB) || 0;
+  if (maxMB > 0 && expectedSize > maxMB * 1024 * 1024) {
+    var bigErr = new Error('视频大小约 ' + (expectedSize / 1024 / 1024).toFixed(0) + 'MB，超过设置的上限 ' + maxMB + 'MB，已跳过下载');
+    bigErr.stage = 'download';
+    bigErr.noRetry = true;
+    throw bigErr;
+  }
+  // “下载+上传”总耗时上限：超过即中止，明确报错而不是等平台掐断。
+  var maxStreamMinutes = Number(settings.maxStreamMinutes) || 12;
+  var deadlineMs = Date.now() + maxStreamMinutes * 60000;
   var base = String(settings.webdavUrl).replace(/\/+$/, '');
   var logUser = settings.logWebdavUser || settings.webdavUser || '';
   var logPass = settings.logWebdavPass || settings.webdavPass || '';
@@ -906,7 +927,6 @@ async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, ret
   var dest = base + '/' + folder + '/' + filename;
   var uploadHeaders = { 'Authorization': 'Basic ' + auth, 'User-Agent': UA, 'Content-Type': 'application/octet-stream' };
   var upload;
-  var expectedSize = Number(download.headers.get('content-length') || 0);
   var uploadThrew = '';
   // 目标文件已存在且大小一致视为上传成功：避免上次上传实际已写入但状态码异常时被反复重下重传。
   var preSize = await webdavRemoteSize(base, folder, filename, auth);
@@ -916,11 +936,11 @@ async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, ret
     await addLog(env, 'info', '[' + (up.name || up.mid) + '] 目标文件已存在，跳上传：' + folderName + '/' + fileBaseName);
     upload = { status: 200 };
   } else {
-    var upState = { sent: 0, tail: null };
+    var upState = { sent: 0, tail: null, deadlineHit: false };
     try {
       if (manual && typeof download.body.tee === 'function') {
         var branches = download.body.tee();
-        var uploadStream = makeCountingUploadStream(branches[0], upState, 1024);
+        var uploadStream = makeCountingUploadStream(branches[0], upState, 1024, deadlineMs);
         var progressStream = branches[1];
         var total = expectedSize;
         var progressPromise = (async function () {
@@ -943,12 +963,16 @@ async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, ret
         await progressPromise;
       } else {
         if (manual) await writeDlProgress(env, { stage: 'upload', message: '上传中...', percent: null });
-        var countedStream = makeCountingUploadStream(download.body, upState, 1024);
+        var countedStream = makeCountingUploadStream(download.body, upState, 1024, deadlineMs);
         upload = await fetch(dest, { method: 'PUT', headers: uploadHeaders, body: countedStream });
       }
     } catch (e) {
       // 长视频上传容易被中间层超时掐断连接，此时服务端可能已经写入完成，不能直接判定失败。
-      uploadThrew = String(e && e.message || e);
+      if (upState.deadlineHit) {
+        uploadThrew = '下载+上传总耗时超过 ' + maxStreamMinutes + ' 分钟上限（Cloudflare Worker 运行时长限制），已中止；建议检查下载接口速度或设置 maxDownloadMB 跳过超大视频';
+      } else {
+        uploadThrew = String(e && e.message || e);
+      }
       upload = null;
     }
   }
@@ -1001,10 +1025,13 @@ async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, ret
     }
     // 连接失败时补建目录，下一轮重试时可直接成功。
     await ensureWebdavFolder(base, folder, auth);
+    // 清理可能残留的半截文件，避免下次误判为已存在。
+    try { await fetch(dest, { method: 'DELETE', headers: { 'Authorization': 'Basic ' + auth, 'User-Agent': UA } }); } catch (e7) {}
     var uploadErr = uploadThrew ? ('WebDAV 上传失败（连接中断或上传未完成）：' + uploadThrew) : 'WebDAV 上传失败（连接中断或上传未完成）';
     if (manual) await writeDlProgress(env, { stage: 'error', message: uploadErr, percent: 0 });
     var err = new Error(uploadErr);
     err.stage = 'upload';
+    if (upState && upState.deadlineHit) err.noRetry = true;
     throw err;
   }
   // 下载流提前结束（实际发出的字节明显少于期望大小）→ 上传的是截断视频，视为失败并清理残留文件。
