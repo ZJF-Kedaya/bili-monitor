@@ -800,7 +800,7 @@ function base64Encode(str) {
 
 async function sendWeCom(webhook, kind, author, title, url, env, extraLines) {
   const lines = [
-    '**B站更新提醒：' + kind + '**',
+    '**' + (author || '未知') + ' 更新提醒：' + kind + '**',
     'UP主：' + (author || '未知'),
     '内容：' + truncate(title, 500),
     '链接：' + url
