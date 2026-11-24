@@ -971,7 +971,7 @@ async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, ret
   var videoUrl = 'https://www.bilibili.com/video/' + bvid;
   var apiUrl = settings.downloadApi + encodeURIComponent(videoUrl);
   if (manual) await writeDlProgress(env, { stage: 'start', message: '准备下载...', percent: 1 });
-  var download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA } });
+  var download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA, 'X-Bili-Cookie': String(settings.cookie || '') } });
   if (!download.ok) {
     var httpErr = new Error('下载接口 HTTP ' + download.status);
     httpErr.stage = 'download';
