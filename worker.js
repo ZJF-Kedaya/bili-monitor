@@ -228,6 +228,8 @@ async function fetchRssVideos(mid, rawBases, env){
       return { base: root, data: { code: 0, message: '0', data: { list: { vlist: vlist } } } };
     } catch (e) {
       lastErr = String(e && e.message || e);
+      // 子请求配额耗尽时再试只会继续烧配额并拖垮同一调用里的后续 UP，立即中止。
+      if (lastErr.indexOf('Too many subrequests') >= 0) break;
     }
   }
   throw new Error('所有RSSHub实例均不可用，最后错误：' + lastErr);
@@ -263,6 +265,8 @@ items.push({ id_str: id, id: id, type: '动态', modules: { module_author: { nam
       return { base: root, data: { code: 0, message: '0', data: { items: items } } };
     } catch (e) {
       lastErr = String(e && e.message || e);
+      // 子请求配额耗尽时立即中止，避免拖垮同一调用里的后续 UP。
+      if (lastErr.indexOf('Too many subrequests') >= 0) break;
     }
   }
   throw new Error('所有RSSHub实例均不可用，最后错误：' + lastErr);
@@ -294,7 +298,9 @@ function encodeWbi(params, mixinKey) {
   return query + '&w_rid=' + md5(query + mixinKey);
 }
 
-async function fetchVideos(mid, cookie, rsshubBase, env) {
+async function fetchVideos(mid, cookie, rsshubBase, env, upName) {
+  var who = '[' + (upName || mid) + '] ';
+  var diag = [];
   const cookie2 = await getFingerCookie(cookie);
   const params = { mid: String(mid), ps: '10', pn: '1', tid: '0', keyword: '', order: 'pubdate' };
   try {
@@ -303,40 +309,80 @@ async function fetchVideos(mid, cookie, rsshubBase, env) {
     const query = encodeWbi(params, mixin);
     const resp = await fetch('https://api.bilibili.com/x/space/wbi/arc/search?' + query, { headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/video') });
     const data = await resp.json();
-    if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) return data;
-  } catch (e) {}
+    if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) {
+      await addLog(env, 'info', who + '视频数据源：直连API(WBI)');
+      return data;
+    }
+    diag.push('直连API(WBI) code=' + (data && data.code) + ' ' + (data && data.message || ''));
+  } catch (e) {
+    diag.push('直连API(WBI)异常：' + String(e && e.message || e));
+  }
   try {
     const query = 'mid=' + encodeURIComponent(String(mid)) + '&ps=10&pn=1&tid=0&keyword=&order=pubdate';
     const resp = await fetch('https://api.bilibili.com/x/space/arc/search?' + query, { headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/video') });
     const data = await resp.json();
-    if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) return data;
-  } catch (e) {}
-  var rssRes = await fetchRssVideos(mid, rsshubBase, env);
-  return rssRes.data;
+    if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) {
+      await addLog(env, 'info', who + '视频数据源：直连API');
+      return data;
+    }
+    diag.push('直连API code=' + (data && data.code) + ' ' + (data && data.message || ''));
+  } catch (e) {
+    diag.push('直连API异常：' + String(e && e.message || e));
+  }
+  try {
+    var rssRes = await fetchRssVideos(mid, rsshubBase, env);
+    await addLog(env, 'info', who + '视频数据源：RSSHub（直连失败：' + diag.join('；') + '）');
+    return rssRes.data;
+  } catch (e) {
+    diag.push('RSSHub：' + String(e && e.message || e));
+    throw new Error('视频获取失败（' + diag.join('；') + '）');
+  }
 }
 
-async function fetchDynamics(mid, cookie, rsshubBase, env, dynamicSource) {
+async function fetchDynamics(mid, cookie, rsshubBase, env, dynamicSource, upName) {
   // dynamicSource: 'direct'（默认）= 直连B站API优先，延迟低；'rss' = 旧方式，RSSHub优先。
   // 无论哪种模式，失败都会自动降级到另一种数据源，最后再兜底重试一次 RSS。
-  var directFirst = dynamicSource !== 'rss';
-  var attempts = directFirst ? ['direct', 'rss'] : ['rss', 'direct'];
+  var who = '[' + (upName || mid) + '] ';
+  var diag = [];
   var cookie2 = null;
+  async function tryDirect() {
+    if (!cookie2) cookie2 = await getFingerCookie(cookie);
+    const url = 'https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=' + encodeURIComponent(String(mid)) + '&timezone_offset=-480&features=itemOpusStyle';
+    const resp = await fetch(url, { headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/dynamic') });
+    const data = await resp.json();
+    if (data && data.code === 0 && data.data && data.data.items && data.data.items.length) {
+      await addLog(env, 'info', who + '动态数据源：直连API');
+      return data;
+    }
+    diag.push('直连API code=' + (data && data.code) + ' ' + (data && data.message || ''));
+    return null;
+  }
+  async function tryRss() {
+    var rssRes = await fetchRssDynamics(mid, rsshubBase, env);
+    if (rssRes && rssRes.data && rssRes.data.data && rssRes.data.data.items) {
+      await addLog(env, 'info', who + '动态数据源：RSSHub（直连失败：' + diag.join('；') + '）');
+      return rssRes.data;
+    }
+    return null;
+  }
+  var directFirst = dynamicSource !== 'rss';
+  var attempts = directFirst ? [tryDirect, tryRss] : [tryRss, tryDirect];
   for (var i = 0; i < attempts.length; i++) {
     try {
-      if (attempts[i] === 'direct') {
-        if (!cookie2) cookie2 = await getFingerCookie(cookie);
-        const url = 'https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=' + encodeURIComponent(String(mid)) + '&timezone_offset=-480&features=itemOpusStyle';
-        const resp = await fetch(url, { headers: biliHeaders(cookie2, 'https://space.bilibili.com/' + String(mid) + '/dynamic') });
-        const data = await resp.json();
-        if (data && data.code === 0 && data.data && data.data.items && data.data.items.length) return data;
-      } else {
-        var rssRes = await fetchRssDynamics(mid, rsshubBase, env);
-        if (rssRes && rssRes.data && rssRes.data.data && rssRes.data.data.items) return rssRes.data;
-      }
-    } catch (e) {}
+      var got = await attempts[i]();
+      if (got) return got;
+    } catch (e) {
+      diag.push((attempts[i] === tryDirect ? '直连API异常：' : 'RSSHub：') + String(e && e.message || e));
+    }
   }
-  var fallbackRss = await fetchRssDynamics(mid, rsshubBase, env);
-  return fallbackRss.data;
+  try {
+    var fallbackRss = await fetchRssDynamics(mid, rsshubBase, env);
+    await addLog(env, 'info', who + '动态数据源：RSSHub(兜底重试)');
+    return fallbackRss.data;
+  } catch (e) {
+    diag.push('RSS兜底重试：' + String(e && e.message || e));
+    throw new Error('动态获取失败（' + diag.join('；') + '）');
+  }
 }async function kvGet(env, key, def) {
   try {
     const raw = await env.BILI_MONITOR_KV.get(key);
@@ -1245,7 +1291,7 @@ async function handleDynamic(item, up, settings, env, handled, persist) {
 }
 
 async function checkVideos(up, settings, old, next, result, handled, env) {
-  const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase, env);
+  const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase, env, up.name || up.mid);
   if (!data || data.code !== 0 || !data.data) throw new Error('视频接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const list = (data.data.list && data.data.list.vlist) || [];
   const first = list[0];
@@ -1320,7 +1366,7 @@ async function checkVideos(up, settings, old, next, result, handled, env) {
   rememberHistory();
 }
 async function checkDynamics(up, settings, old, next, result, handled, env) {
-  const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env, settings.dynamicSource);
+  const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env, settings.dynamicSource, up.name || up.mid);
   if (!data || data.code !== 0 || !data.data) throw new Error('动态接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const items = data.data.items || [];
   var latestVideoItem = null;
@@ -1811,7 +1857,7 @@ if (path === '/api/ups/clear-video' && method === 'POST') {
     // 动态视频：从最新一条动态开始往回找，取第一条带 BV 号的动态
     if (!bvid && kind === 'dynamic') {
       try {
-        const dynData = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env, settings.dynamicSource);
+        const dynData = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env, settings.dynamicSource, up.name || up.mid);
         const items = (dynData && dynData.data && dynData.data.items) || [];
         for (let i = 0; i < items.length; i++) {
           const info = extractDynamicInfo(items[i]);
@@ -1823,7 +1869,7 @@ if (path === '/api/ups/clear-video' && method === 'POST') {
     }
     if (!bvid && kind === 'video') {
       try {
-        const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase, env);
+        const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase, env, up.name || up.mid);
         const list = (data && data.data && data.data.list && data.data.list.vlist) || [];
         if (list.length) { bvid = list[0].bvid; title = list[0].title || bvid; }
       } catch (e) {
