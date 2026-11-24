@@ -22,7 +22,7 @@ const DEFAULT_SETTINGS = {
   // 下载接口太慢时很容易被平台掐断，与其被莫名中止，不如到点明确失败并提示。
   maxStreamMinutes: 12,
   // 单个视频大小上限（MB），0 = 不限制。超过则跳过下载并在通知中说明，避免慢速接口长时间占用。
-  maxDownloadMB: 0,
+  maxDownloadMB: 30,
   ups: []
 };
 
@@ -880,11 +880,12 @@ async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, ret
     typeErr.stage = 'download';
     throw typeErr;
   }
-  var expectedSize = Number(download.headers.get('content-length') || 0);
+  // 下载接口（Vercel Edge 流式代理）会剥离 Content-Length，改用其透传的 X-Content-Length 头兜底。
+  var expectedSize = Number(download.headers.get('content-length') || download.headers.get('x-content-length') || 0);
   // 超大视频跳过：慢速下载会长时间占用 Worker 运行时长（平台有限制），还会拖住其他 UP 的检查。
   var maxMB = Number(settings.maxDownloadMB) || 0;
   if (maxMB > 0 && expectedSize > maxMB * 1024 * 1024) {
-    var bigErr = new Error('视频大小约 ' + (expectedSize / 1024 / 1024).toFixed(0) + 'MB，超过设置的上限 ' + maxMB + 'MB，已跳过下载');
+    var bigErr = new Error('视频太大（约 ' + (expectedSize / 1024 / 1024).toFixed(0) + 'MB，超过 ' + maxMB + 'MB 上限），未自动下载');
     bigErr.stage = 'download';
     bigErr.noRetry = true;
     throw bigErr;
@@ -1172,7 +1173,8 @@ async function handleVideo(item, up, settings, env, handled, persist) {
   }
   if (needNotify && !notifyDone) {
     var didNotify = await performOnce(entry, 'notifyDone', 'notifyTried', function () {
-      return sendWeCom(settings.wecomWebhook, '新视频', author, title, url, env, uploadError ? ['<font color="warning">该视频上传失败</font>', '失败原因：' + truncate(uploadError, 150)] : null);
+      var videoLines = uploadError ? [uploadError.indexOf('视频太大') >= 0 ? '<font color="warning">该视频太大，未自动下载</font>' : '<font color="warning">该视频上传失败</font>', '失败原因：' + truncate(uploadError, 150)] : null;
+      return sendWeCom(settings.wecomWebhook, '新视频', author, title, url, env, videoLines);
     });
     if (didNotify) markHandled(persist, bvid, 'n');
   }
@@ -1209,7 +1211,8 @@ async function handleDynamic(item, up, settings, env, handled, persist) {
   }
   if (needNotify && !notifyDone) {
     var didNotify = await performOnce(entry, 'notifyDone', 'notifyTried', function () {
-      return sendWeCom(settings.wecomWebhook, '新动态', info.author || up.name || up.mid, text, url, env, uploadError ? ['<font color="warning">该视频上传失败</font>', '失败原因：' + truncate(uploadError, 150)] : null);
+      var dynLines = uploadError ? [uploadError.indexOf('视频太大') >= 0 ? '<font color="warning">该视频太大，未自动下载</font>' : '<font color="warning">该视频上传失败</font>', '失败原因：' + truncate(uploadError, 150)] : null;
+      return sendWeCom(settings.wecomWebhook, '新动态', info.author || up.name || up.mid, text, url, env, dynLines);
     });
     if (didNotify) markHandled(persist, bvid, 'n');
   }
