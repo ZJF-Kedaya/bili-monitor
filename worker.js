@@ -316,8 +316,7 @@ function encodeWbi(params, mixinKey) {
   return query + '&w_rid=' + md5(query + mixinKey);
 }
 
-async function fetchVideos(mid, cookie, rsshubBase, env, upName, settings) {
-  var who = '[' + (upName || mid) + '] ';
+async function fetchVideos(mid, cookie, rsshubBase, env, upName, settings, stats) {
   var diag = [];
   var proxy = getApiProxy(settings);
   const cookie2 = await getFingerCookie(cookie);
@@ -333,7 +332,7 @@ async function fetchVideos(mid, cookie, rsshubBase, env, upName, settings) {
     const resp = await biliApiFetch('https://api.bilibili.com/x/space/wbi/arc/search?' + query, cookie2, settings, 'https://space.bilibili.com/' + String(mid) + '/video');
     const data = await resp.json();
     if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) {
-      await addLog(env, 'info', who + '视频数据源：' + sourceLabel);
+      if (stats) stats.video[sourceLabel] = (stats.video[sourceLabel] || 0) + 1;
       return data;
     }
     diag.push(sourceLabel + ' code=' + (data && data.code) + ' ' + (data && data.message || ''));
@@ -344,29 +343,33 @@ async function fetchVideos(mid, cookie, rsshubBase, env, upName, settings) {
     const query = rawQuery;
     const resp = await biliApiFetch('https://api.bilibili.com/x/space/arc/search?' + query, cookie2, settings, 'https://space.bilibili.com/' + String(mid) + '/video');
     const data = await resp.json();
+    var label2 = proxy ? '代理API' : '直连API';
     if (data && data.code === 0 && data.data && data.data.list && data.data.list.vlist && data.data.list.vlist.length) {
-      await addLog(env, 'info', who + '视频数据源：' + (proxy ? '代理API' : '直连API'));
+      if (stats) stats.video[label2] = (stats.video[label2] || 0) + 1;
       return data;
     }
-    diag.push((proxy ? '代理API' : '直连API') + ' code=' + (data && data.code) + ' ' + (data && data.message || ''));
+    diag.push(label2 + ' code=' + (data && data.code) + ' ' + (data && data.message || ''));
   } catch (e) {
     diag.push((proxy ? '代理API' : '直连API') + '异常：' + String(e && e.message || e));
   }
   try {
     var rssRes = await fetchRssVideos(mid, rsshubBase, env);
-    await addLog(env, 'info', who + '视频数据源：RSSHub（直连失败：' + diag.join('；') + '）');
+    if (stats) {
+      stats.video['RSSHub(降级)'] = (stats.video['RSSHub(降级)'] || 0) + 1;
+      stats.fallbacks.push({ up: upName || mid, kind: '视频', reason: diag.join('；') });
+    }
     return rssRes.data;
   } catch (e) {
     diag.push('RSSHub：' + String(e && e.message || e));
+    if (stats) stats.fallbacks.push({ up: upName || mid, kind: '视频', reason: diag.join('；') });
     throw new Error('视频获取失败（' + diag.join('；') + '）');
   }
 }
 
-async function fetchDynamics(mid, cookie, rsshubBase, env, settings, upName) {
+async function fetchDynamics(mid, cookie, rsshubBase, env, settings, upName, stats) {
   // settings.dynamicSource: 'direct'（默认）= 直连B站API优先，延迟低；'rss' = 旧方式，RSSHub优先。
   // 配置了 API代理 时，直连请求走代理（Vercel bilidown，自带匿名Cookie/UA轮换/412重试）。
   // 无论哪种模式，失败都会自动降级到另一种数据源，最后再兜底重试一次 RSS。
-  var who = '[' + (upName || mid) + '] ';
   var diag = [];
   var cookie2 = null;
   var proxy = getApiProxy(settings);
@@ -383,7 +386,7 @@ async function fetchDynamics(mid, cookie, rsshubBase, env, settings, upName) {
     }
     const data = await resp.json();
     if (data && data.code === 0 && data.data && data.data.items && data.data.items.length) {
-      await addLog(env, 'info', who + '动态数据源：' + sourceLabel);
+      if (stats) stats.dyn[sourceLabel] = (stats.dyn[sourceLabel] || 0) + 1;
       return data;
     }
     diag.push(sourceLabel + ' code=' + (data && data.code) + ' ' + (data && data.message || ''));
@@ -392,7 +395,10 @@ async function fetchDynamics(mid, cookie, rsshubBase, env, settings, upName) {
   async function tryRss() {
     var rssRes = await fetchRssDynamics(mid, rsshubBase, env);
     if (rssRes && rssRes.data && rssRes.data.data && rssRes.data.data.items) {
-      await addLog(env, 'info', who + '动态数据源：RSSHub（直连失败：' + diag.join('；') + '）');
+      if (stats) {
+        stats.dyn['RSSHub(降级)'] = (stats.dyn['RSSHub(降级)'] || 0) + 1;
+        stats.fallbacks.push({ up: upName || mid, kind: '动态', reason: diag.join('；') });
+      }
       return rssRes.data;
     }
     return null;
@@ -409,10 +415,14 @@ async function fetchDynamics(mid, cookie, rsshubBase, env, settings, upName) {
   }
   try {
     var fallbackRss = await fetchRssDynamics(mid, rsshubBase, env);
-    await addLog(env, 'info', who + '动态数据源：RSSHub(兜底重试)');
+    if (stats) {
+      stats.dyn['RSSHub(兜底)'] = (stats.dyn['RSSHub(兜底)'] || 0) + 1;
+      stats.fallbacks.push({ up: upName || mid, kind: '动态', reason: diag.join('；') });
+    }
     return fallbackRss.data;
   } catch (e) {
     diag.push('RSS兜底重试：' + String(e && e.message || e));
+    if (stats) stats.fallbacks.push({ up: upName || mid, kind: '动态', reason: diag.join('；') });
     throw new Error('动态获取失败（' + diag.join('；') + '）');
   }
 }async function kvGet(env, key, def) {
@@ -1324,8 +1334,8 @@ async function handleDynamic(item, up, settings, env, handled, persist) {
   return true;
 }
 
-async function checkVideos(up, settings, old, next, result, handled, env) {
-  const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase, env, up.name || up.mid, settings);
+async function checkVideos(up, settings, old, next, result, handled, env, srcStats) {
+  const data = await fetchVideos(up.mid, settings.cookie, settings.rsshubBase, env, up.name || up.mid, settings, srcStats);
   if (!data || data.code !== 0 || !data.data) throw new Error('视频接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const list = (data.data.list && data.data.list.vlist) || [];
   const first = list[0];
@@ -1399,8 +1409,8 @@ async function checkVideos(up, settings, old, next, result, handled, env) {
   next.videoTitle = first.title || '';
   rememberHistory();
 }
-async function checkDynamics(up, settings, old, next, result, handled, env) {
-  const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env, settings, up.name || up.mid);
+async function checkDynamics(up, settings, old, next, result, handled, env, srcStats) {
+  const data = await fetchDynamics(up.mid, settings.cookie, settings.rsshubBase, env, settings, up.name || up.mid, srcStats);
   if (!data || data.code !== 0 || !data.data) throw new Error('动态接口风控：code ' + (data && data.code) + ' ' + (data && data.message || '返回异常') + '（请使用含 buvid3/buvid4/SESSDATA 的完整Cookie，并降低检查频率）');
   const items = data.data.items || [];
   var latestVideoItem = null;
@@ -1582,6 +1592,7 @@ async function checkAllInner(env) {
   const nextMap = {};
   const result = { videos: [], dynamics: [], errors: [] };
   const handledBvids = {};
+  const srcStats = { video: {}, dyn: {}, fallbacks: [] };
   for (const up of settings.ups) {
     await touchCheckLock(env);
     const old = oldMap[up.mid] || {};
@@ -1596,7 +1607,7 @@ async function checkAllInner(env) {
     };
     if (up.monitorVideo !== false) {
       try {
-        await checkVideos(up, settings, old, nextMap[up.mid], result, handledBvids, env);
+        await checkVideos(up, settings, old, nextMap[up.mid], result, handledBvids, env, srcStats);
       } catch (e) {
         const msg = '[' + (up.name || up.mid) + '] 视频检查失败：' + String(e.message || e);
         result.errors.push(msg);
@@ -1605,7 +1616,7 @@ async function checkAllInner(env) {
     }
     if (up.monitorDynamic !== false) {
       try {
-        await checkDynamics(up, settings, old, nextMap[up.mid], result, handledBvids, env);
+        await checkDynamics(up, settings, old, nextMap[up.mid], result, handledBvids, env, srcStats);
       } catch (e) {
         const msg = '[' + (up.name || up.mid) + '] 动态检查失败：' + String(e.message || e);
         result.errors.push(msg);
@@ -1613,6 +1624,34 @@ async function checkAllInner(env) {
       }
     }
     capHandled(nextMap[up.mid].handled, 40);
+  }
+  // 数据源汇总：一轮检查只记一条，不再逐 UP 刷屏
+  function statJoin(obj) { return Object.keys(obj).map(function (k) { return k + '×' + obj[k]; }).join(' / ') || '无'; }
+  await addLog(env, 'info', '数据源统计：视频[' + statJoin(srcStats.video) + ']，动态[' + statJoin(srcStats.dyn) + ']');
+  if (srcStats.fallbacks.length) {
+    // 降级原因去重后最多记 3 条，完整原因已在各 UP 的检查失败日志里
+    var seenReason = {};
+    var shown = 0;
+    for (var fi = 0; fi < srcStats.fallbacks.length && shown < 3; fi++) {
+      var fb = srcStats.fallbacks[fi];
+      var rkey = fb.kind + '|' + fb.reason;
+      if (seenReason[rkey]) continue;
+      seenReason[rkey] = 1;
+      await addLog(env, 'warn', '[' + fb.up + '] ' + fb.kind + '数据源降级：' + truncate(fb.reason, 300));
+      shown++;
+    }
+    // API 异常（代理/直连均不可用）→ 企微提醒，1 小时冷却防止每轮轰炸
+    var lastApiAlertAt = 0;
+    try { lastApiAlertAt = Number(await stateGet(env, 'apiAlertAt', 0)) || 0; } catch (eA) {}
+    if (Date.now() - lastApiAlertAt > 60 * 60000 && settings.wecomWebhook) {
+      try {
+        await statePut(env, 'apiAlertAt', Date.now());
+        await sendWeCom(settings.wecomWebhook, 'API异常告警', 'B站数据源监控', '本轮 ' + srcStats.fallbacks.length + ' 个数据源请求失败，代理/直连均不可用，已降级RSS或检查失败。原因示例：' + truncate(srcStats.fallbacks[0].reason, 200), '-', env);
+        await addLog(env, 'warn', '已发送企微API异常告警（1小时内不重复）');
+      } catch (eA2) {
+        await addLog(env, 'error', '企微API异常告警发送失败：' + String(eA2 && eA2.message || eA2));
+      }
+    }
   }
   if (JSON.stringify(nextMap) !== JSON.stringify(oldMap)) {
     await statePut(env, 'lastSeen', nextMap);
