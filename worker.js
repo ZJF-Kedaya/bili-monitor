@@ -1464,8 +1464,12 @@ async function c189UploadBlob(env, settings, rawFileName, u8, dirId, onProgress,
     const seg = u8.subarray(i * SLICE, Math.min((i + 1) * SLICE, u8.length));
     const sm = c189Md5Create();
     sm.update(seg);
-    sliceHexs.push(sm.hex().toUpperCase());
-    partInfos.push((i + 1) + '-' + c189RawToBase64(sm.raw()));
+    // 关键：只 finalize 一次！hex 与 base64 必须派生自同一份原始摘要。
+    // 此前 hex() 后再 raw() 会在已 padding 的状态上二次 finalize，导致 partInfo 摘要错误
+    // → 服务器回填的 Content-MD5 与真实 body 不符 → 稳定 BadDigest。
+    const sraw = sm.raw();
+    sliceHexs.push(c189RawToHex(sraw));
+    partInfos.push((i + 1) + '-' + c189RawToBase64(sraw));
     fileMd5.update(seg);
   }
   const fileMd5Hex = fileMd5.hex().toUpperCase();
@@ -1542,6 +1546,11 @@ function c189RawToBase64(raw) {
   let bin = '';
   for (let i = 0; i < raw.length; i++) bin += String.fromCharCode(raw[i]);
   return btoa(bin);
+}
+function c189RawToHex(raw) {
+  let s = '';
+  for (let i = 0; i < raw.length; i++) s += (raw[i] < 16 ? '0' : '') + raw[i].toString(16);
+  return s.toUpperCase();
 }
 
 // ===== 天翼云盘下载+上传主流程（downloadAndUploadOnce 的 c189 分支）=====
