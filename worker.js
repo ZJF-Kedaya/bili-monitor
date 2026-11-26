@@ -2551,6 +2551,8 @@ async function handleApi(request, env) {
   if (path === '/api/c189-diag') {
     const settings = await getSettings(env);
     const bvidQ = url.searchParams.get('bvid');
+    const dirIdQ = url.searchParams.get('dirId') || '-11';
+    const nameQ = url.searchParams.get('name') || '';
     const out = { putResults: [] };
     try {
       const t = await c189EnsureSession(env, settings);
@@ -2580,13 +2582,14 @@ async function handleApi(request, env) {
         u8 = new Uint8Array(received);
         let off = 0;
         for (let i = 0; i < chunks.length; i++) { u8.set(chunks[i], off); off += chunks[i].byteLength; }
+        const md5Ahex = md5A.hex().toUpperCase(); // 注意：hex() 只能调一次（内部会 finalize）
         const md5B = c189Md5Create().update(u8).hex().toUpperCase(); // 组装后整体 MD5
         out.selfCheck = {
           receivedBytes: received,
           chunkCount: chunks.length,
-          md5_perChunkIncremental: md5A.hex().toUpperCase(),
+          md5_perChunkIncremental: md5Ahex,
           md5_assembled: md5B,
-          match: md5A.hex().toUpperCase() === md5B,
+          match: md5Ahex === md5B,
           first16BytesHex: Array.from(u8.slice(0, 16)).map(function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join(' '),
         };
       } else {
@@ -2599,9 +2602,9 @@ async function handleApi(request, env) {
       out.fileSize = u8.length;
       out.fileMd5 = fileMd5;
       out.partInfo = partInfo;
-      const fileName = (bvidQ ? '_diag_real_' + bvidQ : '_diag_upload_' + Date.now()) + '.mp4';
+      const fileName = nameQ || (bvidQ ? '_diag_real_' + bvidQ : '_diag_upload_' + Date.now()) + '.mp4';
       const init = await c189Api(env, settings, 'GET', C189.UPLOAD_URL + '/person/initMultiUpload', {
-        parentFolderId: '-11', fileName: encodeURIComponent(fileName),
+        parentFolderId: dirIdQ, fileName: encodeURIComponent(fileName),
         fileSize: String(u8.length), sliceSize: String(10 * 1024 * 1024), lazyCheck: '1',
       });
       out.init = init;
