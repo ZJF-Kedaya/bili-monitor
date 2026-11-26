@@ -1355,8 +1355,22 @@ async function c189ApiSigned(env, settings, method, url, params, extraQuery) {
   return j;
 }
 async function c189Api(env, settings, method, url, params, extraQuery) {
-  await c189EnsureSession(env, settings);
-  return await c189ApiSigned(env, settings, method, url, params, extraQuery);
+  // 天翼服务端/边缘偶发 522/5xx（CF error page）与网络抖动：签名 GET 调用均为幂等操作，
+  // 对可重试错误自动重试 3 次（间隔递增），避免一次抖动导致整个上传失败。
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await c189EnsureSession(env, settings);
+      return await c189ApiSigned(env, settings, method, url, params, extraQuery);
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e && e.message || e);
+      const retryable = /接口错误\(5\d\d\)|error code: 5\d\d|fetch failed|网络错误|timed? ?out|ECONN|UND_ERR|socket/i.test(msg);
+      if (attempt === 3 || !retryable) throw e;
+      await sleepMs(2000 * attempt);
+    }
+  }
+  throw lastErr;
 }
 
 // ===== 目录与文件 =====
