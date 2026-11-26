@@ -1442,6 +1442,8 @@ async function c189UploadBlob(env, settings, rawFileName, u8, dirId, onProgress,
   await c189EnsureSession(env, settings);
   const SLICE = 10 * 1024 * 1024;
   const count = Math.max(1, Math.ceil(u8.length / SLICE));
+  // 开始日志：失败时可从日志面板直接比对 fileMd5 与网盘实际文件，判断是否为传输截断
+  await addLog(env, 'info', '[天翼上传] ' + fileName + '：' + (u8.length / 1024 / 1024).toFixed(2) + 'MB，' + count + ' 分片，目录 ' + dirId);
   const fileMd5 = c189Md5Create();
   const sliceHexs = []; const partInfos = [];
   for (let i = 0; i < count; i++) {
@@ -1488,8 +1490,9 @@ async function c189UploadBlob(env, settings, rawFileName, u8, dirId, onProgress,
       ];
       let ok = false; let lastErr = '';
       for (let vi = 0; vi < putVariants.length && !ok; vi++) {
-        // 变体0（油猴同款）最多试2次（5xx/网络抖动）；4xx 立即换变体
-        for (let retry = 0; retry < (vi === 0 ? 2 : 1) && !ok; retry++) {
+        // 变体0（油猴同款）最多试3次；4xx 原则上换变体，但 BadDigest（大 body 传输截断）
+        // 属瞬时网络问题，同变体重试有意义
+        for (let retry = 0; retry < (vi === 0 ? 3 : 1) && !ok; retry++) {
           if (heartbeatFn) { try { await heartbeatFn(); } catch (eHb) {} }
           try {
             const pr = await fetch(putVariants[vi].url, { method: 'PUT', headers: putVariants[vi].headers, body: seg });
@@ -1497,7 +1500,10 @@ async function c189UploadBlob(env, settings, rawFileName, u8, dirId, onProgress,
             let respSnippet = '';
             try { respSnippet = String(await pr.text()).slice(0, 200); } catch (eT) {}
             lastErr = 'HTTP ' + pr.status + (respSnippet ? ' resp=' + respSnippet : '') + ' (变体' + (vi + 1) + ')';
-            if (pr.status >= 400 && pr.status < 500) break; // 请求形态问题，换下一变体
+            if (pr.status >= 400 && pr.status < 500) {
+              if (respSnippet.indexOf('BadDigest') !== -1 && retry < (vi === 0 ? 2 : 0)) { await sleepMs(2000 * (retry + 1)); continue; }
+              break; // 其他4xx：请求形态问题，换下一变体
+            }
             await sleepMs(1000 * (retry + 1));
           } catch (e) {
             lastErr = '变体' + (vi + 1) + ': ' + String(e && e.message || e);
