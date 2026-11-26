@@ -2521,9 +2521,84 @@ async function handleApi(request, env) {
     }
   }
 
+  // 天翼云盘上传诊断：真实上传一个 64KB 测试文件到网盘根目录，逐步记录 getMultiUploadUrls
+  // 完整响应 / requestHeader / 各 PUT 变体的状态码与响应体，用于排查 BadDigest 等问题。
+  // 浏览器直接访问 /api/c189-diag 即可，返回 JSON（成功后网盘根目录会多一个 _diag_upload_*.bin，可手动删除）。
+  if (path === '/api/c189-diag') {
+    const settings = await getSettings(env);
+    const out = { putResults: [] };
+    try {
+      const t = await c189EnsureSession(env, settings);
+      out.session = { loginName: t.LoginName || '' };
+      const u8 = new Uint8Array(64 * 1024);
+      for (let i = 0; i < u8.length; i++) u8[i] = (i * 7 + 13) & 0xFF;
+      const fileMd5 = c189Md5Create().update(u8).hex().toUpperCase();
+      const smd5 = c189Md5Create().update(u8);
+      const partInfo = '1-' + c189RawToBase64(smd5.raw());
+      out.fileMd5 = fileMd5;
+      out.partInfo = partInfo;
+      const fileName = '_diag_upload_' + Date.now() + '.bin';
+      const init = await c189Api(env, settings, 'GET', C189.UPLOAD_URL + '/person/initMultiUpload', {
+        parentFolderId: '-11', fileName: encodeURIComponent(fileName),
+        fileSize: String(u8.length), sliceSize: String(10 * 1024 * 1024), lazyCheck: '1',
+      });
+      out.init = init;
+      const uploadFileId = init && init.data && init.data.uploadFileId;
+      if (!uploadFileId) throw new Error('initMultiUpload 失败');
+      const ur = await c189Api(env, settings, 'GET', C189.UPLOAD_URL + '/person/getMultiUploadUrls', {
+        uploadFileId: uploadFileId, partInfo: partInfo,
+      });
+      out.getUrls = ur;
+      const urlsMap = (ur && ur.uploadUrls) || (ur && ur.data && ur.data.uploadUrls);
+      const info = urlsMap && urlsMap['partNumber_1'];
+      if (!info) throw new Error('未拿到 partNumber_1，urlsMap=' + JSON.stringify(urlsMap).slice(0, 300));
+      const putHeaders = {};
+      String(info.requestHeader || '').split('&').forEach(function (kv) {
+        const idx = kv.indexOf('=');
+        if (idx > 0) putHeaders[kv.slice(0, idx)] = kv.slice(idx + 1);
+      });
+      out.putHeaders = putHeaders;
+      out.requestHeaderRaw = info.requestHeader;
+      const putBase = info.requestURL.replace(/^http:\/\//i, 'https://');
+      const putUrl = putBase + (putBase.indexOf('?') === -1 ? '?' : '&') + c189Qs(c189Suffix());
+      const gm = Object.assign({ 'Accept': 'application/json;charset=UTF-8', 'Referer': C189.WEB_URL }, putHeaders);
+      const variants = [
+        ['v1_GM同款头+suffix', putUrl, gm],
+        ['v2_仅requestHeader+suffix', putUrl, putHeaders],
+        ['v3_GM同款头+无suffix', putBase, gm],
+        ['v4_v1+显式Content-MD5(partInfo摘要)', putUrl, Object.assign({}, gm, { 'Content-MD5': partInfo.slice(2) })],
+        ['v5_v1+显式Content-MD5=小写hex', putUrl, Object.assign({}, gm, { 'Content-MD5': fileMd5 })],
+      ];
+      let okVariant = -1;
+      for (let vi = 0; vi < variants.length; vi++) {
+        try {
+          const r = await fetch(variants[vi][1], { method: 'PUT', headers: variants[vi][2], body: u8 });
+          let body = '';
+          try { body = String(await r.text()).slice(0, 300); } catch (eT) {}
+          out.putResults.push({ variant: variants[vi][0], status: r.status, resp: body });
+          if ((r.status === 200 || r.status === 201) && okVariant < 0) okVariant = vi;
+        } catch (eP) {
+          out.putResults.push({ variant: variants[vi][0], error: String(eP && eP.message || eP) });
+        }
+      }
+      if (okVariant >= 0) {
+        const cm = await c189Api(env, settings, 'GET', C189.UPLOAD_URL + '/person/commitMultiUploadFile', {
+          uploadFileId: uploadFileId, fileMd5: fileMd5, sliceMd5: fileMd5,
+          lazyCheck: '1', isLog: '0', opertype: '3',
+        });
+        out.commit = cm;
+        out.result = '成功，变体: ' + variants[okVariant][0];
+      } else {
+        out.result = '全部变体失败';
+      }
+    } catch (e) {
+      out.error = String(e && e.message || e);
+    }
+    return json(out);
+  }
+
   // 天翼云盘：列出目录内容（前端目录选择器用）
-  if (path === '/api/c189-list' && method === 'POST') {
-    const body = await readJson(request);
+  if (path === '/api/c189-list' && method === 'POST') {    const body = await readJson(request);
     const s = Object.assign({}, await getSettings(env), (body && (body.settings || body)) || {});
     try {
       const folderId = String((body && body.folderId) || s.c189DirId || '-11').trim() || '-11';
