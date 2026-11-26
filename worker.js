@@ -1662,15 +1662,19 @@ async function downloadAndUploadC189(settings, up, bvid, title, env, manual, dow
   return { dest: dest, fileName: result.fileName };
 }
 
-// 外层包装：下载接口偶发抽风（HTTP 5xx/567 等）或 WebDAV PUT 返回 404（目录丢失）时自动重试一次。
+// 外层包装：下载接口偶发抽风（HTTP 5xx/403/567 等，多为 CDN 对 Vercel 出口 IP 的间歇性风控）
+// 或 WebDAV PUT 返回 404（目录丢失）时自动重试，最多 3 次（间隔 5 秒）。
 async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
-  try {
-    return await downloadAndUploadOnce(settings, up, bvid, title, env, manual, false);
-  } catch (e) {
-    if (!e || e.noRetry || (e.stage !== 'download' && e.stage !== 'upload404')) throw e;
-    await addLog(env, 'info', '[' + (up.name || up.mid) + '] ' + String(e && e.message || e) + '，5 秒后自动重试一次');
-    await sleepMs(5000);
-    return await downloadAndUploadOnce(settings, up, bvid, title, env, manual, true);
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await downloadAndUploadOnce(settings, up, bvid, title, env, manual, attempt > 1);
+    } catch (e) {
+      const retryable = e && !e.noRetry && (e.stage === 'download' || e.stage === 'upload404');
+      if (!retryable || attempt === maxAttempts) throw e;
+      await addLog(env, 'info', '[' + (up.name || up.mid) + '] ' + String(e && e.message || e) + '，5 秒后自动重试（第 ' + (attempt + 1) + '/' + maxAttempts + ' 次）');
+      await sleepMs(5000);
+    }
   }
 }
 
