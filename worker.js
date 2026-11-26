@@ -2550,18 +2550,56 @@ async function handleApi(request, env) {
   // 浏览器直接访问 /api/c189-diag 即可，返回 JSON（成功后网盘根目录会多一个 _diag_upload_*.bin，可手动删除）。
   if (path === '/api/c189-diag') {
     const settings = await getSettings(env);
+    const bvidQ = url.searchParams.get('bvid');
     const out = { putResults: [] };
     try {
       const t = await c189EnsureSession(env, settings);
       out.session = { loginName: t.LoginName || '' };
-      const u8 = new Uint8Array(64 * 1024);
-      for (let i = 0; i < u8.length; i++) u8[i] = (i * 7 + 13) & 0xFF;
+      let u8;
+      if (bvidQ) {
+        // 真实复现模式：与正式上传完全相同的数据路径下载该视频，并做组装自检
+        const dlUrl = settings.downloadApi + encodeURIComponent('https://www.bilibili.com/video/' + bvidQ);
+        const download = await fetch(dlUrl, { headers: { 'User-Agent': UA, 'X-Bili-Cookie': String(settings.cookie || '') } });
+        out.download = {
+          status: download.status,
+          contentType: download.headers.get('content-type'),
+          contentLength: download.headers.get('content-length'),
+          xContentLength: download.headers.get('x-content-length'),
+        };
+        const reader = download.body.getReader();
+        const chunks = [];
+        let received = 0;
+        const md5A = c189Md5Create(); // 分片增量 MD5（读一块算一块）
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          chunks.push(part.value);
+          received += part.value.byteLength || part.value.length || 0;
+          md5A.update(part.value);
+        }
+        u8 = new Uint8Array(received);
+        let off = 0;
+        for (let i = 0; i < chunks.length; i++) { u8.set(chunks[i], off); off += chunks[i].byteLength; }
+        const md5B = c189Md5Create().update(u8).hex().toUpperCase(); // 组装后整体 MD5
+        out.selfCheck = {
+          receivedBytes: received,
+          chunkCount: chunks.length,
+          md5_perChunkIncremental: md5A.hex().toUpperCase(),
+          md5_assembled: md5B,
+          match: md5A.hex().toUpperCase() === md5B,
+          first16BytesHex: Array.from(u8.slice(0, 16)).map(function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join(' '),
+        };
+      } else {
+        u8 = new Uint8Array(64 * 1024);
+        for (let i = 0; i < u8.length; i++) u8[i] = (i * 7 + 13) & 0xFF;
+      }
       const fileMd5 = c189Md5Create().update(u8).hex().toUpperCase();
       const smd5 = c189Md5Create().update(u8);
       const partInfo = '1-' + c189RawToBase64(smd5.raw());
+      out.fileSize = u8.length;
       out.fileMd5 = fileMd5;
       out.partInfo = partInfo;
-      const fileName = '_diag_upload_' + Date.now() + '.bin';
+      const fileName = (bvidQ ? '_diag_real_' + bvidQ : '_diag_upload_' + Date.now()) + '.mp4';
       const init = await c189Api(env, settings, 'GET', C189.UPLOAD_URL + '/person/initMultiUpload', {
         parentFolderId: '-11', fileName: encodeURIComponent(fileName),
         fileSize: String(u8.length), sliceSize: String(10 * 1024 * 1024), lazyCheck: '1',
@@ -2583,6 +2621,7 @@ async function handleApi(request, env) {
       });
       out.putHeaders = putHeaders;
       out.requestHeaderRaw = info.requestHeader;
+      out.requestHost = (info.requestURL.match(/^https?:\/\/[^\/]+/i) || [''])[0];
       const putBase = info.requestURL.replace(/^http:\/\//i, 'https://');
       const putUrl = putBase + (putBase.indexOf('?') === -1 ? '?' : '&') + c189Qs(c189Suffix());
       const gm = Object.assign({ 'Accept': 'application/json;charset=UTF-8', 'Referer': C189.WEB_URL }, putHeaders);
@@ -2591,7 +2630,6 @@ async function handleApi(request, env) {
         ['v2_仅requestHeader+suffix', putUrl, putHeaders],
         ['v3_GM同款头+无suffix', putBase, gm],
         ['v4_v1+显式Content-MD5(partInfo摘要)', putUrl, Object.assign({}, gm, { 'Content-MD5': partInfo.slice(2) })],
-        ['v5_v1+显式Content-MD5=小写hex', putUrl, Object.assign({}, gm, { 'Content-MD5': fileMd5 })],
       ];
       let okVariant = -1;
       for (let vi = 0; vi < variants.length; vi++) {
