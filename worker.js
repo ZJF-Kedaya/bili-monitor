@@ -1478,15 +1478,32 @@ async function c189UploadBlob(env, settings, rawFileName, u8, dirId, onProgress,
       const putBase = info.requestURL.replace(/^http:\/\//i, 'https://');
       const putUrl = putBase + (putBase.indexOf('?') === -1 ? '?' : '&') + c189Qs(c189Suffix());
       const seg = u8.subarray(s * SLICE, Math.min((s + 1) * SLICE, u8.length));
+      // 与油猴 GM_xhr 完全同款：默认带 Accept + Referer: cloud.189.cn（部分 CDN 对裸 PUT 返回 400）
+      const gmPutHeaders = Object.assign({ 'Accept': 'application/json;charset=UTF-8', 'Referer': C189.WEB_URL }, putHeaders);
+      // 变体依次尝试：GM_xhr 同款头+suffix → 仅 requestHeader → 不带 suffix（URL 签名严格时）
+      const putVariants = [
+        { url: putUrl, headers: gmPutHeaders },
+        { url: putUrl, headers: putHeaders },
+        { url: putBase, headers: gmPutHeaders },
+      ];
       let ok = false; let lastErr = '';
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const pr = await fetch(putUrl, { method: 'PUT', headers: putHeaders, body: seg });
-          if (pr.status === 200) { ok = true; break; }
-          lastErr = 'HTTP ' + pr.status;
-        } catch (e) { lastErr = String(e && e.message || e); }
-        if (!ok && heartbeatFn) { try { await heartbeatFn(); } catch (eHb) {} }
-        await sleepMs(1000 * (attempt + 1));
+      for (let vi = 0; vi < putVariants.length && !ok; vi++) {
+        // 变体0（油猴同款）最多试2次（5xx/网络抖动）；4xx 立即换变体
+        for (let retry = 0; retry < (vi === 0 ? 2 : 1) && !ok; retry++) {
+          if (heartbeatFn) { try { await heartbeatFn(); } catch (eHb) {} }
+          try {
+            const pr = await fetch(putVariants[vi].url, { method: 'PUT', headers: putVariants[vi].headers, body: seg });
+            if (pr.status === 200 || pr.status === 201) { ok = true; break; }
+            let respSnippet = '';
+            try { respSnippet = String(await pr.text()).slice(0, 200); } catch (eT) {}
+            lastErr = 'HTTP ' + pr.status + (respSnippet ? ' resp=' + respSnippet : '') + ' (变体' + (vi + 1) + ')';
+            if (pr.status >= 400 && pr.status < 500) break; // 请求形态问题，换下一变体
+            await sleepMs(1000 * (retry + 1));
+          } catch (e) {
+            lastErr = '变体' + (vi + 1) + ': ' + String(e && e.message || e);
+            await sleepMs(1000);
+          }
+        }
       }
       if (!ok) throw new Error('分片' + (s + 1) + '/' + count + '上传失败: ' + lastErr);
       if (onProgress) onProgress(Math.min((s + 1) * SLICE, u8.length), u8.length);
