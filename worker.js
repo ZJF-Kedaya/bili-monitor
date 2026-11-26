@@ -1768,17 +1768,20 @@ async function downloadAndUploadC189(settings, up, bvid, title, env, manual, dow
 }
 
 // 外层包装：下载接口偶发抽风（HTTP 5xx/403/567 等，多为 CDN 对 Vercel 出口 IP 的间歇性风控）
-// 或 WebDAV PUT 返回 404（目录丢失）时自动重试，最多 3 次（间隔 5 秒）。
+// 或 WebDAV PUT 返回 404（目录丢失）时自动重试，最多 5 次。
+// 退避 5s/15s/30s/60s：风控与网关超时都是几十秒级的抖动窗口，固定 5 秒往往在窗口内连撞。
 async function downloadAndUploadVideo(settings, up, bvid, title, env, manual) {
-  const maxAttempts = 3;
+  const maxAttempts = 5;
+  const backoffMs = [5000, 15000, 30000, 60000];
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await downloadAndUploadOnce(settings, up, bvid, title, env, manual, attempt > 1);
     } catch (e) {
       const retryable = e && !e.noRetry && (e.stage === 'download' || e.stage === 'upload404');
       if (!retryable || attempt === maxAttempts) throw e;
-      await addLog(env, 'info', '[' + (up.name || up.mid) + '] ' + String(e && e.message || e) + '，5 秒后自动重试（第 ' + (attempt + 1) + '/' + maxAttempts + ' 次）');
-      await sleepMs(5000);
+      const wait = backoffMs[Math.min(attempt - 1, backoffMs.length - 1)];
+      await addLog(env, 'info', '[' + (up.name || up.mid) + '] ' + String(e && e.message || e) + '，' + Math.round(wait / 1000) + ' 秒后自动重试（第 ' + (attempt + 1) + '/' + maxAttempts + ' 次）');
+      await sleepMs(wait);
     }
   }
 }
@@ -1790,7 +1793,17 @@ async function downloadAndUploadOnce(settings, up, bvid, title, env, manual, ret
   if (manual) await writeDlProgress(env, { stage: 'start', message: '准备下载...', percent: 1 });
   var download = await fetch(apiUrl, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': UA, 'X-Bili-Cookie': String(settings.cookie || '') } });
   if (!download.ok) {
-    var httpErr = new Error('下载接口 HTTP ' + download.status);
+    // 失败时把响应体与关键来源头一起记进日志：567 这类非标准码不写明源头根本没法判断
+    var errBody = '';
+    try { errBody = String(await download.text()).slice(0, 300); } catch (eR) {}
+    var srcHint = [];
+    ['x-vercel-error', 'x-vercel-id', 'server', 'cf-ray', 'x-cache', 'via', 'x-trace-id'].forEach(function (h) {
+      var hv = download.headers.get(h);
+      if (hv) srcHint.push(h + '=' + String(hv).slice(0, 50));
+    });
+    var httpErr = new Error('下载接口 HTTP ' + download.status
+      + (errBody ? '：' + truncate(errBody.replace(/\s+/g, ' '), 160) : '')
+      + (srcHint.length ? '（' + srcHint.join(', ') + '）' : ''));
     httpErr.stage = 'download';
     throw httpErr;
   }
