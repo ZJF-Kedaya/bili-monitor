@@ -994,7 +994,7 @@ const C189 = {
   RETURN_URL: 'https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html',
   CHANNEL_ID: 'web_cloud.189.cn',
 };
-var c189Mem = { token: null, tokenTs: 0, sessionTs: 0, dirCache: new Map(), inputMode: '' };
+var c189Mem = { token: null, tokenTs: 0, sessionTs: 0, dirCache: new Map(), inputMode: '', sessionPromise: null };
 
 function c189Suffix() {
   return { clientType: 'TELEPC', version: C189.VERSION, channelId: C189.CHANNEL_ID,
@@ -1263,58 +1263,128 @@ async function c189LoginFromCookie(env, settings) {
   await c189GetSessionFromRedirect(env, finalUrl);
   return c189Mem.token;
 }
+// 设置里的登录信息是哪种形态：json（粘贴 bdp_c189_token）/ ticket（跳转网址）/ cookie / none
+function c189CookieMode(settings) {
+  const raw = String((settings && settings.c189Cookie) || '').trim();
+  if (!raw) return 'none';
+  if (raw.charAt(0) === '{' || raw.charAt(0) === '"') return 'json';
+  return /^https?:\/\//i.test(raw) ? 'ticket' : 'cookie';
+}
+// 5xx/网络抖动属于「接口暂时不可用」，不能据此判定会话失效
+function c189IsTransient(msg) {
+  const s = String(msg || '');
+  if (/接口错误\(5\d\d\)/.test(s)) return true;
+  return /error code: ?5\d\d|fetch failed|网络错误|timed? ?out|ECONN|UND_ERR|socket hung up|连接超时|522|503|504/i.test(s);
+}
+// 用 accessToken 换新会话（成功即写盘）。返回 { token } 或 { error, soft }（soft=接口抖动，非会话失效）
+async function c189SessionFromAccessToken(env, t) {
+  try {
+    const qs = c189Qs(Object.assign(c189Suffix(), { returnType: 'JSON', appId: C189.APP_ID, accessToken: t.AccessToken }));
+    const resp = await fetch(C189.API_URL + '/getSessionForPC.action?' + qs, { headers: c189AnonHeaders({ 'X-Request-ID': c189Uuid() }) });
+    const txt = await resp.text();
+    const j = c189ParseJson(txt);
+    // 成功响应可能不带 res_code，只要拿到 sessionKey/sessionSecret 即算成功
+    if (j && j.sessionKey && j.sessionSecret && (j.res_code == null || j.res_code == 0)) {
+      t.SessionKey = j.sessionKey; t.SessionSecret = j.sessionSecret;
+      if (j.accessToken) t.AccessToken = j.accessToken;
+      if (j.refreshToken) t.RefreshToken = j.refreshToken;
+      await c189SaveToken(env, t);
+      c189Mem.sessionTs = Date.now();
+      return { token: t };
+    }
+    return { error: 'HTTP ' + resp.status + ' ' + String(txt).slice(0, 150), soft: resp.status >= 500 || c189IsTransient(txt) };
+  } catch (e) {
+    const m = String(e && e.message || e);
+    return { error: m.slice(0, 150), soft: c189IsTransient(m) };
+  }
+}
 // 会话保活与刷新（带 120s TTL：一次上传流程中目录探测与上传各调一次，避免重复保活请求）
+// 同一 isolate 内并发调用合并成一次，避免两个请求同时换 SessionKey 互相踩掉
 async function c189EnsureSession(env, settings) {
   const t = await c189GetToken(env);
   if (!t) return await c189LoginFromCookie(env, settings);
+  if (!c189Mem.inputMode) c189Mem.inputMode = c189CookieMode(settings);
   if (Date.now() - c189Mem.sessionTs < 120000) return c189Mem.token;
-  try {
-    await c189ApiSigned(env, settings, 'GET', C189.API_URL + '/keepUserSession.action');
-    c189Mem.sessionTs = Date.now();
-    return c189Mem.token;
-  } catch (e1) {
-    // 1) accessToken 换新会话
+  if (!c189Mem.sessionPromise) c189Mem.sessionPromise = c189EnsureSessionInner(env, settings, t);
+  const p = c189Mem.sessionPromise;
+  try { return await p; }
+  finally { if (c189Mem.sessionPromise === p) c189Mem.sessionPromise = null; }
+}
+async function c189EnsureSessionInner(env, settings, t) {
+  const notes = [];
+  let anyDefinite = false;
+
+  // 0) keepUserSession 保活（天翼边缘偶发 522/5xx：退避重试 3 次；只有业务层拒绝才算会话失效）
+  let keepMsg = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      if (!t.AccessToken) throw new Error('no accessToken');
-      const qs = c189Qs(Object.assign(c189Suffix(), { returnType: 'JSON', appId: C189.APP_ID, accessToken: t.AccessToken }));
-      const resp = await fetch(C189.API_URL + '/getSessionForPC.action?' + qs, { headers: c189AnonHeaders({ 'X-Request-ID': c189Uuid() }) });
-      const j = c189ParseJson(await resp.text());
-      if (j && j.res_code == 0 && j.sessionKey) {
-        t.SessionKey = j.sessionKey; t.SessionSecret = j.sessionSecret;
-        if (j.accessToken) t.AccessToken = j.accessToken;
-        if (j.refreshToken) t.RefreshToken = j.refreshToken;
-        await c189SaveToken(env, t);
-        c189Mem.sessionTs = Date.now();
-        return t;
-      }
-      throw new Error('session refresh failed');
-    } catch (e2) {
-      // 2) refreshToken 刷新
-      try {
-        if (!t.RefreshToken) throw new Error('no refreshToken');
-        const resp2 = await fetch(C189.AUTH_URL + '/api/oauth2/refreshToken.do', {
-          method: 'POST',
-          headers: c189AnonHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' }),
-          body: c189Qs({ clientId: C189.APP_ID, refreshToken: t.RefreshToken, grantType: 'refresh_token', format: 'json' }),
-        });
-        const j2 = c189ParseJson(await resp2.text());
-        if (!j2 || !j2.accessToken) throw new Error('refreshToken failed');
-        t.AccessToken = j2.accessToken; t.RefreshToken = j2.refreshToken;
-        await c189SaveToken(env, t);
-        c189Mem.sessionTs = 0;
-        return await c189EnsureSession(env, settings);
-      } catch (e3) {
-        // 3) 回退：用设置里的登录信息重新获取会话。
-        //    JSON 会话模式（粘贴 bdp_c189_token）没有登录流程可回退，直接报错防止递归死循环
-        if (c189Mem.inputMode === 'json') {
-          const err = new Error('天翼会话已完全失效（keepUserSession/accessToken/refreshToken 均失败）——请在油猴脚本里重新扫码登录后，复制新的 bdp_c189_token 粘贴进来');
-          err.noRetry = true;
-          throw err;
-        }
-        return await c189LoginFromCookie(env, settings);
-      }
+      await c189ApiSigned(env, settings, 'GET', C189.API_URL + '/keepUserSession.action');
+      c189Mem.sessionTs = Date.now();
+      return c189Mem.token;
+    } catch (e0) {
+      keepMsg = String(e0 && e0.message || e0);
+      if (!c189IsTransient(keepMsg)) { anyDefinite = true; break; }
+      if (attempt === 3) break;
+      await sleepMs(1500 * attempt);
     }
   }
+  notes.push('keepUserSession=' + keepMsg.slice(0, 150));
+
+  // 1) accessToken 换新会话
+  if (t.AccessToken) {
+    const r1 = await c189SessionFromAccessToken(env, t);
+    if (r1.token) return r1.token;
+    if (!r1.soft) anyDefinite = true;
+    notes.push('accessToken=' + r1.error);
+  } else {
+    notes.push('accessToken=无');
+  }
+
+  // 2) refreshToken 刷新（成功后立刻用新 accessToken 换会话）
+  if (t.RefreshToken) {
+    try {
+      const resp2 = await fetch(C189.AUTH_URL + '/api/oauth2/refreshToken.do', {
+        method: 'POST',
+        headers: c189AnonHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' }),
+        body: c189Qs({ clientId: C189.APP_ID, refreshToken: t.RefreshToken, grantType: 'refresh_token', format: 'json' }),
+      });
+      const txt2 = await resp2.text();
+      const j2 = c189ParseJson(txt2);
+      if (j2 && j2.accessToken) {
+        t.AccessToken = j2.accessToken;
+        if (j2.refreshToken) t.RefreshToken = j2.refreshToken;
+        await c189SaveToken(env, t);
+        const r2 = await c189SessionFromAccessToken(env, t);
+        if (r2.token) return r2.token;
+        if (!r2.soft) anyDefinite = true;
+        notes.push('refreshToken=换到 accessToken 但换会话失败: ' + r2.error);
+      } else {
+        if (!(resp2.status >= 500 || c189IsTransient(txt2))) anyDefinite = true;
+        notes.push('refreshToken=HTTP ' + resp2.status + ' ' + String(txt2).slice(0, 150));
+      }
+    } catch (e2) {
+      const m2 = String(e2 && e2.message || e2);
+      if (!c189IsTransient(m2)) anyDefinite = true;
+      notes.push('refreshToken=' + m2.slice(0, 150));
+    }
+  } else {
+    notes.push('refreshToken=无');
+  }
+
+  const detail = '（' + notes.join('；') + '）';
+  // 3a) 全部失败都是 5xx/网络抖动 → 可重试错误，绝不能误报「会话失效」让用户去重新扫码
+  if (!anyDefinite) {
+    const errSoft = new Error('天翼接口暂时不可用，会话续签请求全部遇到 5xx/网络超时' + detail + '——稍后会自动重试');
+    errSoft.stage = 'upload';
+    throw errSoft;
+  }
+  // 3b) 有业务层拒绝：JSON 会话模式没有登录流程可回退，直接报错
+  if (c189Mem.inputMode === 'json') {
+    const err = new Error('天翼会话已完全失效' + detail + '——请在油猴脚本里重新扫码登录后，复制新的 bdp_c189_token 粘贴进来');
+    err.noRetry = true;
+    throw err;
+  }
+  return await c189LoginFromCookie(env, settings);
 }
 
 // ===== 签名 API 请求（HMAC-SHA1 签名 + AES-ECB 加密 params）=====
@@ -1365,7 +1435,7 @@ async function c189Api(env, settings, method, url, params, extraQuery) {
     } catch (e) {
       lastErr = e;
       const msg = String(e && e.message || e);
-      const retryable = /接口错误\(5\d\d\)|error code: 5\d\d|fetch failed|网络错误|timed? ?out|ECONN|UND_ERR|socket/i.test(msg);
+      const retryable = /接口错误\(5\d\d\)|error code: 5\d\d|fetch failed|网络错误|timed? ?out|ECONN|UND_ERR|socket|暂时不可用/i.test(msg);
       if (attempt === 3 || !retryable) throw e;
       await sleepMs(2000 * attempt);
     }
@@ -2551,6 +2621,65 @@ async function handleApi(request, env) {
       return json({ ok: true, loginName: t.LoginName || '' });
     } catch (e) {
       return json({ ok: false, error: String(e && e.message || e) });
+    }
+  }
+
+  // 天翼会话诊断：逐步复现 keepUserSession → accessToken 换会话 → refreshToken，
+  // 原样返回每步状态码与响应体，用来判断是「会话真失效」还是「接口抖动被误判」。
+  // 浏览器直接访问 /api/c189-session-diag
+  if (path === '/api/c189-session-diag') {
+    const settings = await getSettings(env);
+    const out = { steps: {} };
+    try {
+      const t = await c189GetToken(env);
+      out.input = { mode: c189CookieMode(settings), length: String(settings.c189Cookie || '').length };
+      if (!t) { out.error = '本地还没有已保存的天翼会话（从未成功登录过）'; return json(out); }
+      out.token = {
+        LoginName: t.LoginName || '',
+        SessionKey: String(t.SessionKey || '').slice(0, 12) + '…',
+        hasSessionSecret: !!t.SessionSecret,
+        AccessToken: String(t.AccessToken || '').slice(0, 8) + '…',
+        RefreshToken: String(t.RefreshToken || '').slice(0, 8) + '…',
+        sessionTsAgoSec: c189Mem.sessionTs ? Math.round((Date.now() - c189Mem.sessionTs) / 1000) : null,
+      };
+      // A) 保活（原样重试 3 次，不参与判定）
+      out.steps.keepUserSession = [];
+      for (let i = 1; i <= 3; i++) {
+        try {
+          const j = await c189ApiSigned(env, settings, 'GET', C189.API_URL + '/keepUserSession.action');
+          out.steps.keepUserSession.push({ try: i, ok: true, resp: JSON.stringify(j).slice(0, 200) });
+          c189Mem.sessionTs = Date.now();
+          break;
+        } catch (e) {
+          out.steps.keepUserSession.push({ try: i, ok: false, error: String(e && e.message || e).slice(0, 300) });
+          await sleepMs(1000);
+        }
+      }
+      // B) accessToken 换会话
+      if (t.AccessToken) {
+        try {
+          const qs = c189Qs(Object.assign(c189Suffix(), { returnType: 'JSON', appId: C189.APP_ID, accessToken: t.AccessToken }));
+          const r = await fetch(C189.API_URL + '/getSessionForPC.action?' + qs, { headers: c189AnonHeaders({ 'X-Request-ID': c189Uuid() }) });
+          const txt = await r.text();
+          out.steps.accessToken = { status: r.status, resp: String(txt).slice(0, 400) };
+        } catch (e) { out.steps.accessToken = { error: String(e && e.message || e).slice(0, 200) }; }
+      }
+      // C) refreshToken
+      if (t.RefreshToken) {
+        try {
+          const r2 = await fetch(C189.AUTH_URL + '/api/oauth2/refreshToken.do', {
+            method: 'POST',
+            headers: c189AnonHeaders({ 'Content-Type': 'application/x-www-form-urlencoded' }),
+            body: c189Qs({ clientId: C189.APP_ID, refreshToken: t.RefreshToken, grantType: 'refresh_token', format: 'json' }),
+          });
+          const txt2 = await r2.text();
+          out.steps.refreshToken = { status: r2.status, resp: String(txt2).slice(0, 400) };
+        } catch (e) { out.steps.refreshToken = { error: String(e && e.message || e).slice(0, 200) }; }
+      }
+      return json(out);
+    } catch (e) {
+      out.error = String(e && e.message || e);
+      return json(out);
     }
   }
 
