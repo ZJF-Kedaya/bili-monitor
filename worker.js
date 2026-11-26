@@ -994,7 +994,7 @@ const C189 = {
   RETURN_URL: 'https://m.cloud.189.cn/zhuanti/2020/loginErrorPc/index.html',
   CHANNEL_ID: 'web_cloud.189.cn',
 };
-var c189Mem = { token: null, tokenTs: 0, sessionTs: 0, dirCache: new Map(), inputMode: '', sessionPromise: null };
+var c189Mem = { token: null, tokenTs: 0, sessionTs: 0, dirCache: new Map(), inputMode: '', sessionPromise: null, accBlockUntil: 0, refreshBlockUntil: 0 };
 
 function c189Suffix() {
   return { clientType: 'TELEPC', version: C189.VERSION, channelId: C189.CHANNEL_ID,
@@ -1176,6 +1176,8 @@ async function c189GetToken(env) {
 }
 async function c189SaveToken(env, t) {
   c189Mem.token = t; c189Mem.tokenTs = Date.now();
+  // 换了新凭据就清掉备用链的冷却，避免新 token 被旧冷却挡住
+  c189Mem.accBlockUntil = 0; c189Mem.refreshBlockUntil = 0;
   await statePut(env, 'c189Token', t);
 }
 // 从跳转地址换取会话
@@ -1312,10 +1314,14 @@ async function c189EnsureSession(env, settings) {
 }
 async function c189EnsureSessionInner(env, settings, t) {
   const notes = [];
-  let anyDefinite = false;
-
-  // 0) keepUserSession 保活（天翼边缘偶发 522/5xx：退避重试 3 次；只有业务层拒绝才算会话失效）
+  // 判定原则：keepUserSession 是唯一能证明「会话有效/失效」的调用。
+  // 它的业务层拒绝（res_message/res_code）才算真失效；5xx/网络抖动一律按可重试处理，
+  // 不能因为备用链（accessToken/refreshToken 常已过期或限流）也失败就去误报会话失效。
   let keepMsg = '';
+  let keepDefinite = false;
+  let keepTransient = false;
+
+  // 0) keepUserSession 保活（天翼边缘偶发 522/5xx：退避重试 3 次）
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await c189ApiSigned(env, settings, 'GET', C189.API_URL + '/keepUserSession.action');
@@ -1323,25 +1329,27 @@ async function c189EnsureSessionInner(env, settings, t) {
       return c189Mem.token;
     } catch (e0) {
       keepMsg = String(e0 && e0.message || e0);
-      if (!c189IsTransient(keepMsg)) { anyDefinite = true; break; }
-      if (attempt === 3) break;
+      keepTransient = c189IsTransient(keepMsg);
+      keepDefinite = !keepTransient;
+      if (!keepTransient || attempt === 3) break;
       await sleepMs(1500 * attempt);
     }
   }
   notes.push('keepUserSession=' + keepMsg.slice(0, 150));
 
-  // 1) accessToken 换新会话
-  if (t.AccessToken) {
+  // 1) accessToken 换新会话（AccessToken 有效期短，失败属常态；带 30 分钟冷却避免重复 400）
+  if (t.AccessToken && Date.now() >= (c189Mem.accBlockUntil || 0)) {
     const r1 = await c189SessionFromAccessToken(env, t);
     if (r1.token) return r1.token;
-    if (!r1.soft) anyDefinite = true;
+    // UserInvalidOpenToken 说明这个 accessToken 已永久无效，短期内不必再试
+    if (/UserInvalidOpenToken|accessToken.*invalid/i.test(r1.error)) c189Mem.accBlockUntil = Date.now() + 30 * 60000;
     notes.push('accessToken=' + r1.error);
   } else {
-    notes.push('accessToken=无');
+    notes.push('accessToken=' + (t.AccessToken ? '冷却中' : '无'));
   }
 
-  // 2) refreshToken 刷新（成功后立刻用新 accessToken 换会话）
-  if (t.RefreshToken) {
+  // 2) refreshToken 刷新（429 说明被限流，冷却 10 分钟；成功后立刻用新 accessToken 换会话）
+  if (t.RefreshToken && Date.now() >= (c189Mem.refreshBlockUntil || 0)) {
     try {
       const resp2 = await fetch(C189.AUTH_URL + '/api/oauth2/refreshToken.do', {
         method: 'POST',
@@ -1350,37 +1358,35 @@ async function c189EnsureSessionInner(env, settings, t) {
       });
       const txt2 = await resp2.text();
       const j2 = c189ParseJson(txt2);
+      if (resp2.status === 429) c189Mem.refreshBlockUntil = Date.now() + 10 * 60000;
       if (j2 && j2.accessToken) {
         t.AccessToken = j2.accessToken;
         if (j2.refreshToken) t.RefreshToken = j2.refreshToken;
+        c189Mem.accBlockUntil = 0;
         await c189SaveToken(env, t);
         const r2 = await c189SessionFromAccessToken(env, t);
         if (r2.token) return r2.token;
-        if (!r2.soft) anyDefinite = true;
         notes.push('refreshToken=换到 accessToken 但换会话失败: ' + r2.error);
       } else {
-        if (!(resp2.status >= 500 || c189IsTransient(txt2))) anyDefinite = true;
         notes.push('refreshToken=HTTP ' + resp2.status + ' ' + String(txt2).slice(0, 150));
       }
     } catch (e2) {
-      const m2 = String(e2 && e2.message || e2);
-      if (!c189IsTransient(m2)) anyDefinite = true;
-      notes.push('refreshToken=' + m2.slice(0, 150));
+      notes.push('refreshToken=' + String(e2 && e2.message || e2).slice(0, 150));
     }
   } else {
-    notes.push('refreshToken=无');
+    notes.push('refreshToken=' + (t.RefreshToken ? '冷却中' : '无'));
   }
 
   const detail = '（' + notes.join('；') + '）';
-  // 3a) 全部失败都是 5xx/网络抖动 → 可重试错误，绝不能误报「会话失效」让用户去重新扫码
-  if (!anyDefinite) {
-    const errSoft = new Error('天翼接口暂时不可用，会话续签请求全部遇到 5xx/网络超时' + detail + '——稍后会自动重试');
+  // 3a) 保活只是遇到 5xx/网络抖动 → 可重试错误（备用链失败属预期，不作为失效依据）
+  if (!keepDefinite) {
+    const errSoft = new Error('天翼接口暂时不可用（keepUserSession 遇到 ' + (keepTransient ? '5xx/网络超时' : '异常') + '）' + detail + '——稍后会自动重试');
     errSoft.stage = 'upload';
     throw errSoft;
   }
-  // 3b) 有业务层拒绝：JSON 会话模式没有登录流程可回退，直接报错
+  // 3b) 保活被业务层拒绝：JSON 会话模式没有登录流程可回退，直接报错
   if (c189Mem.inputMode === 'json') {
-    const err = new Error('天翼会话已完全失效' + detail + '——请在油猴脚本里重新扫码登录后，复制新的 bdp_c189_token 粘贴进来');
+    const err = new Error('天翼会话已失效' + detail + '——请在油猴脚本里重新扫码登录后，复制新的 bdp_c189_token 粘贴进来');
     err.noRetry = true;
     throw err;
   }
